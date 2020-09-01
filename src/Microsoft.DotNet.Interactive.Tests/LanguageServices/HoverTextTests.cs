@@ -1,7 +1,7 @@
 ﻿// Copyright (c) .NET Foundation and contributors. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
-using System.Linq;
+using System;
 using System.Threading.Tasks;
 using FluentAssertions;
 using Microsoft.CodeAnalysis.Text;
@@ -191,6 +191,47 @@ namespace Microsoft.DotNet.Interactive.Tests.LanguageServices
                 .LinePositionSpan
                 .Should()
                 .Be(new LinePositionSpan(new LinePosition(line, 8), new LinePosition(line, 17)));
+        }
+
+        [Theory]
+        [InlineData(Language.CSharp)]
+        [InlineData(Language.FSharp, Skip = "not implemented in fsharp")]
+        public async Task csharp_hover_text_is_returned_for_shadowing_variables(Language language)
+        {
+            SubmitCode declaration = null;
+            SubmitCode shadowingDeclaration = null;
+            using var kernel = CreateKernel(language);
+            switch (language)
+            {
+                case Language.CSharp:
+                    declaration = new SubmitCode("var identifier = 1234;");
+                    shadowingDeclaration = new SubmitCode("var identifier = \"one-two-three-four\";");
+                    break;
+                case Language.FSharp:
+                    declaration = new SubmitCode("let identifier = 1234");
+                    shadowingDeclaration = new SubmitCode("let identifier = \"one-two-three-four\"");
+                    break;
+
+            }
+            await kernel.SendAsync(declaration); 
+
+            await kernel.SendAsync(shadowingDeclaration); 
+
+            var markupCode = "ident$$ifier";
+
+            MarkupTestFile.GetLineAndColumn(markupCode, out var code, out var line, out var column);
+
+            var commandResult = await SendHoverRequest(kernel, code, line, column);
+
+            commandResult
+                .KernelEvents
+                .ToSubscribedList()
+                .Should()
+                .ContainSingle<HoverTextProduced>()
+                .Which
+                .Content
+                .Should()
+                .ContainSingle(fv => fv.Value == "(field) string identifier");
         }
     }
 }

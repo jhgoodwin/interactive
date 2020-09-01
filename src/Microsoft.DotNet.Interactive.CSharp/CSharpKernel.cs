@@ -3,33 +3,37 @@
 
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
+
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Completion;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Scripting;
 using Microsoft.CodeAnalysis.QuickInfo;
-using Microsoft.CodeAnalysis.Recommendations;
 using Microsoft.CodeAnalysis.Scripting;
 using Microsoft.DotNet.Interactive.Commands;
 using Microsoft.DotNet.Interactive.Events;
 using Microsoft.DotNet.Interactive.Extensions;
 using Microsoft.DotNet.Interactive.Formatting;
 using Microsoft.DotNet.Interactive.Utility;
+
 using XPlot.Plotly;
+
 using CompletionItem = Microsoft.DotNet.Interactive.Events.CompletionItem;
 
 namespace Microsoft.DotNet.Interactive.CSharp
 {
     public class CSharpKernel :
-        DotNetLanguageKernel,
+        DotNetKernel,
         IExtensibleKernel,
         ISupportNuget,
         IKernelCommandHandler<RequestCompletions>,
+        IKernelCommandHandler<RequestDiagnostics>,
         IKernelCommandHandler<RequestHoverText>,
         IKernelCommandHandler<SubmitCode>
     {
@@ -47,6 +51,7 @@ namespace Microsoft.DotNet.Interactive.CSharp
 
         internal ScriptOptions ScriptOptions =
             ScriptOptions.Default
+                         .WithMetadataResolver(CachingMetadataResolver.Default.WithBaseDirectory(Directory.GetCurrentDirectory()))
                          .WithLanguageVersion(LanguageVersion.Latest)
                          .AddImports(
                              "System",
@@ -70,6 +75,7 @@ namespace Microsoft.DotNet.Interactive.CSharp
         public CSharpKernel() : base(DefaultKernelName)
         {
             _workspace = new InteractiveWorkspace();
+            _currentDirectory = Directory.GetCurrentDirectory();
 
             _packageRestoreContext = new Lazy<PackageRestoreContext>(() =>
             {
@@ -84,7 +90,7 @@ namespace Microsoft.DotNet.Interactive.CSharp
             {
                 _workspace.Dispose();
                 _workspace = null;
-                
+
                 _packageRestoreContext = null;
                 ScriptState = null;
                 ScriptOptions = null;
@@ -99,6 +105,13 @@ namespace Microsoft.DotNet.Interactive.CSharp
             return Task.FromResult(SyntaxFactory.IsCompleteSubmission(syntaxTree));
         }
 
+        public override IReadOnlyCollection<string> GetVariableNames() =>
+            ScriptState?.Variables
+                       .Select(v => v.Name)
+                       .Distinct()
+                       .ToArray() ??
+            Array.Empty<string>();
+
         public override bool TryGetVariable<T>(
             string name,
             out T value)
@@ -106,7 +119,7 @@ namespace Microsoft.DotNet.Interactive.CSharp
             if (ScriptState?.Variables
                            .LastOrDefault(v => v.Name == name) is { } variable)
             {
-                value = (T) variable.Value;
+                value = (T)variable.Value;
                 return true;
             }
 
@@ -129,12 +142,14 @@ namespace Microsoft.DotNet.Interactive.CSharp
 
         public async Task HandleAsync(RequestHoverText command, KernelInvocationContext context)
         {
-            var document = _workspace.ForkDocument(command.Code);
+            using var _ = new GCPressure(1024 * 1024);
+            
+            var document = _workspace.UpdateWorkingDocument(command.Code);
             var text = await document.GetTextAsync();
             var cursorPosition = text.Lines.GetPosition(command.LinePosition);
             var service = QuickInfoService.GetService(document);
             var info = await service.GetQuickInfoAsync(document, cursorPosition);
-
+            
             if (info == null)
             {
                 return;
@@ -152,6 +167,8 @@ namespace Microsoft.DotNet.Interactive.CSharp
                         new FormattedValue("text/markdown", info.ToMarkdownString())
                     },
                     correctedLinePosSpan));
+            
+            
         }
 
         public async Task HandleAsync(SubmitCode submitCode, KernelInvocationContext context)
@@ -178,6 +195,7 @@ namespace Microsoft.DotNet.Interactive.CSharp
             }
 
             Exception exception = null;
+            string message = null;
 
             if (!context.CancellationToken.IsCancellationRequested)
             {
@@ -204,17 +222,38 @@ namespace Microsoft.DotNet.Interactive.CSharp
 
             if (!context.CancellationToken.IsCancellationRequested)
             {
+                var diagnostics = ImmutableArray<CodeAnalysis.Diagnostic>.Empty;
+
+                // Check for a compilation failure
+                if (exception is CodeSubmissionCompilationErrorException compilationError &&
+                    compilationError.InnerException is CompilationErrorException innerCompilationException)
+                {
+                    diagnostics = innerCompilationException.Diagnostics;
+                    // In the case of an error the diagnostics get attached to both the 
+                    // DiagnosticsProduced and CommandFailed events.
+                    message =
+                        string.Join(Environment.NewLine,
+                                    innerCompilationException.Diagnostics.Select(d => d.ToString()) ?? Enumerable.Empty<string>());
+                }
+                else
+                {
+                    diagnostics = ScriptState?.Script.GetCompilation().GetDiagnostics() ?? ImmutableArray<CodeAnalysis.Diagnostic>.Empty;
+                }
+
+                // Publish the compilation diagnostics. This doesn't include the exception.
+                var kernelDiagnostics = diagnostics.Select(Diagnostic.FromCodeAnalysisDiagnostic).ToImmutableArray();
+
+                var formattedDiagnostics =
+                    diagnostics
+                        .Select(d => d.ToString())
+                        .Select(text => new FormattedValue(PlainTextFormatter.MimeType, text))
+                        .ToImmutableArray();
+
+                context.Publish(new DiagnosticsProduced(kernelDiagnostics, submitCode, formattedDiagnostics)); ;
+
+                // Report the compilation failure or exception
                 if (exception != null)
                 {
-                    string message = null;
-
-                    if (exception is CodeSubmissionCompilationErrorException compilationError)
-                    {
-                        message =
-                            string.Join(Environment.NewLine,
-                                        (compilationError.InnerException as CompilationErrorException)?.Diagnostics.Select(d => d.ToString()) ?? Enumerable.Empty<string>());
-                    }
-
                     context.Fail(exception, message);
                 }
                 else
@@ -246,7 +285,7 @@ namespace Microsoft.DotNet.Interactive.CSharp
             {
                 _currentDirectory = currentDirectory;
                 ScriptOptions = ScriptOptions.WithMetadataResolver(
-                    ScriptMetadataResolver.Default.WithBaseDirectory(
+                    CachingMetadataResolver.Default.WithBaseDirectory(
                         _currentDirectory));
             }
 
@@ -270,7 +309,7 @@ namespace Microsoft.DotNet.Interactive.CSharp
 
             if (ScriptState.Exception is null)
             {
-                await _workspace.AddSubmissionAsync(ScriptState);
+                _workspace.UpdateWorkspace(ScriptState);
             }
         }
 
@@ -290,36 +329,44 @@ namespace Microsoft.DotNet.Interactive.CSharp
             string code,
             int cursorPosition)
         {
-            var document = _workspace.ForkDocument(code);
 
+            using var _ = new GCPressure(1024 * 1024);
+
+            var document = _workspace.UpdateWorkingDocument(code);
             var service = CompletionService.GetService(document);
-            
             var completionList = await service.GetCompletionsAsync(document, cursorPosition);
-
+           
             if (completionList is null)
             {
                 return Enumerable.Empty<CompletionItem>();
             }
 
-            var semanticModel = await document.GetSemanticModelAsync();
-            var symbols = await Recommender.GetRecommendedSymbolsAtPositionAsync(
-                              semanticModel, 
-                              cursorPosition, 
-                              document.Project.Solution.Workspace);
-
-            var symbolToSymbolKey = new Dictionary<(string, int), ISymbol>();
-            foreach (var symbol in symbols)
-            {
-                var key = (symbol.Name, (int) symbol.Kind);
-                if (!symbolToSymbolKey.ContainsKey(key))
-                {
-                    symbolToSymbolKey[key] = symbol;
-                }
-            }
-
-            var items = completionList.Items.Select(item => item.ToModel(symbolToSymbolKey, document)).ToArray();
-
+            var items = completionList.Items.Select(item => item.ToModel()).ToArray();
             return items;
+        }
+
+        internal DiagnosticsProduced GetDiagnosticsProduced(
+            KernelCommand command,
+            ImmutableArray<CodeAnalysis.Diagnostic> diagnostics)
+        {
+            var kernelDiagnostics = diagnostics.Select(Diagnostic.FromCodeAnalysisDiagnostic).ToImmutableArray();
+            var formattedDiagnostics =
+                diagnostics
+                    .Select(d => d.ToString())
+                    .Select(text => new FormattedValue(PlainTextFormatter.MimeType, text))
+                    .ToImmutableArray();
+
+            return new DiagnosticsProduced(kernelDiagnostics, command, formattedDiagnostics);
+        }
+
+        public async Task HandleAsync(
+            RequestDiagnostics command,
+            KernelInvocationContext context)
+        {
+            var document = _workspace.UpdateWorkingDocument(command.Code);
+            var semanticModel = await document.GetSemanticModelAsync();
+            var diagnostics = semanticModel.GetDiagnostics();
+            context.Publish(GetDiagnosticsProduced(command, diagnostics));
         }
 
         public async Task LoadExtensionsFromDirectoryAsync(
@@ -336,7 +383,7 @@ namespace Microsoft.DotNet.Interactive.CSharp
 
         private bool HasReturnValue =>
             ScriptState != null &&
-            (bool) _hasReturnValueMethod.Invoke(ScriptState.Script, null);
+            (bool)_hasReturnValueMethod.Invoke(ScriptState.Script, null);
 
         void ISupportNuget.AddRestoreSource(string source) => _packageRestoreContext.Value.AddRestoreSource(source);
 
@@ -356,13 +403,13 @@ namespace Microsoft.DotNet.Interactive.CSharp
 
         Task<PackageRestoreResult> ISupportNuget.RestoreAsync() => _packageRestoreContext.Value.RestoreAsync();
 
-        public IEnumerable<PackageReference> RequestedPackageReferences => 
+        public IEnumerable<PackageReference> RequestedPackageReferences =>
             PackageRestoreContext.RequestedPackageReferences;
 
-        public IEnumerable<ResolvedPackageReference> ResolvedPackageReferences => 
+        public IEnumerable<ResolvedPackageReference> ResolvedPackageReferences =>
             PackageRestoreContext.ResolvedPackageReferences;
 
-        public IEnumerable<string> RestoreSources => 
+        public IEnumerable<string> RestoreSources =>
             PackageRestoreContext.RestoreSources;
     }
 }

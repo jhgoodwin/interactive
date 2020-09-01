@@ -38,14 +38,14 @@ namespace Microsoft.DotNet.Interactive.Commands
 
         public string TargetKernelName { get; internal set; }
 
-        public virtual async Task InvokeAsync(KernelInvocationContext context)
+        public virtual Task InvokeAsync(KernelInvocationContext context)
         {
             if (Handler == null)
             {
                 throw new NoSuitableKernelException(this);
             }
 
-            await Handler(this, context);
+            return Handler(this, context);
         }
     }
 }

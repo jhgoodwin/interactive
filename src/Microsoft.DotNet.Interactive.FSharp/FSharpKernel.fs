@@ -5,18 +5,21 @@ namespace Microsoft.DotNet.Interactive.FSharp
 
 open System
 open System.Collections.Generic
+open System.Collections.Immutable
 open System.IO
 open System.Runtime.InteropServices
 open System.Text
 open System.Threading
 open System.Threading.Tasks
 
+open Microsoft.CodeAnalysis
 open Microsoft.CodeAnalysis.Tags
+open Microsoft.CodeAnalysis.Text
 open Microsoft.DotNet.Interactive
 open Microsoft.DotNet.Interactive.Commands
 open Microsoft.DotNet.Interactive.Events
 open Microsoft.DotNet.Interactive.Extensions
-open Microsoft.DotNet.Interactive.Utility
+open Microsoft.DotNet.Interactive.Formatting
 
 open FSharp.Compiler.Interactive.Shell
 open FSharp.Compiler.Scripting
@@ -25,7 +28,7 @@ open FSharp.Compiler.SourceCodeServices
 [<AbstractClass>]
 type FSharpKernelBase () as this =
 
-    inherit DotNetLanguageKernel("fsharp")
+    inherit DotNetKernel("fsharp")
 
     static let lockObj = Object();
 
@@ -38,7 +41,7 @@ type FSharpKernelBase () as this =
 
     let mutable cancellationTokenSource = new CancellationTokenSource()
 
-    let kindString (glyph: FSharpGlyph) =
+    let getKindString (glyph: FSharpGlyph) =
         match glyph with
         | FSharpGlyph.Class -> WellKnownTags.Class
         | FSharpGlyph.Constant -> WellKnownTags.Constant
@@ -62,7 +65,7 @@ type FSharpKernelBase () as this =
         | FSharpGlyph.ExtensionMethod -> WellKnownTags.ExtensionMethod
         | FSharpGlyph.Error -> WellKnownTags.Error
 
-    let filterText (declarationItem: FSharpDeclarationListItem) =
+    let getFilterText (declarationItem: FSharpDeclarationListItem) =
         match declarationItem.NamespaceToOpen, declarationItem.Name.Split '.' with
         // There is no namespace to open and the item name does not contain dots, so we don't need to pass special FilterText to Roslyn.
         | None, [|_|] -> null
@@ -70,44 +73,72 @@ type FSharpKernelBase () as this =
         // We are passing last part of long ident as FilterText.
         | _, idents -> Array.last idents
 
-    let documentation (declarationItem: FSharpDeclarationListItem) =
+    let getDocumentation (declarationItem: FSharpDeclarationListItem) =
         let result = declarationItem.DescriptionTextAsync
         result.ToString()
 
-    let completionItem (declarationItem: FSharpDeclarationListItem) =
-        let kind = kindString declarationItem.Glyph
-        let filterText = filterText declarationItem
-        let documentation = documentation declarationItem
+    let getCompletionItem (declarationItem: FSharpDeclarationListItem) =
+        let kind = getKindString declarationItem.Glyph
+        let filterText = getFilterText declarationItem
+        let documentation = getDocumentation declarationItem
         CompletionItem(declarationItem.Name, kind, filterText=filterText, documentation=documentation)
+
+    let getDiagnostic (error: FSharpErrorInfo) =
+        // F# errors are 1-based but should be 0-based for diagnostics, however, 0-based errors are still valid to report
+        let diagLineDelta = if error.Start.Line = 0 then 0 else -1
+        let startPos = LinePosition(error.Start.Line + diagLineDelta, error.Start.Column)
+        let endPos = LinePosition(error.End.Line + diagLineDelta, error.End.Column)
+        let linePositionSpan = LinePositionSpan(startPos, endPos)
+        let severity =
+            match error.Severity with
+            | FSharpErrorSeverity.Error -> DiagnosticSeverity.Error
+            | FSharpErrorSeverity.Warning -> DiagnosticSeverity.Warning
+        let errorId = sprintf "FS%04i" error.ErrorNumber
+        Diagnostic(linePositionSpan, severity, errorId, error.Message)
 
     let handleSubmitCode (codeSubmission: SubmitCode) (context: KernelInvocationContext) =
         async {
             let codeSubmissionReceived = CodeSubmissionReceived(codeSubmission)
             context.Publish(codeSubmissionReceived)
             let tokenSource = cancellationTokenSource
-            let result, errors =
+            let result, fsiDiagnostics =
                 try
                     script.Value.Eval(codeSubmission.Code, tokenSource.Token)
                 with
                 | ex -> Error(ex), [||]
 
+            let diagnostics = fsiDiagnostics |> Array.map getDiagnostic |> fun x -> x.ToImmutableArray()
+            
+            // script.Eval can succeed with error diagnostics, see https://github.com/dotnet/interactive/issues/691
+            let isError = fsiDiagnostics |> Array.exists (fun d -> d.Severity = FSharpErrorSeverity.Error)
+
+            let formattedDiagnostics =
+                fsiDiagnostics
+                |> Array.map (fun d -> d.ToString())
+                |> Array.map (fun text -> new FormattedValue(PlainTextFormatter.MimeType, text))
+
+            context.Publish(DiagnosticsProduced(diagnostics, codeSubmission, formattedDiagnostics))
+
             match result with
-            | Ok(result) ->
+            | Ok(result) when not isError ->
+
                 match result with
                 | Some(value) when value.ReflectionType <> typeof<unit>  ->
                     let value = value.ReflectionValue
                     let formattedValues = FormattedValue.FromObject(value)
                     context.Publish(ReturnValueProduced(value, codeSubmission, formattedValues))
-                | Some(value) -> ()
+                | Some _ 
                 | None -> ()
-            | Error(ex) ->
+            | _ ->
                 if not (tokenSource.IsCancellationRequested) then
-                    let aggregateError = String.Join("\n", errors)
-                    let reportedException =
-                        match ex with
-                        | :? FsiCompilationException -> CodeSubmissionCompilationErrorException(ex) :> Exception
-                        | _ -> ex
-                    context.Fail(reportedException, aggregateError)
+                    let aggregateError = String.Join("\n", fsiDiagnostics )
+                    match result with
+                    | Error (:? FsiCompilationException) 
+                    | Ok _ ->
+                        let ex = CodeSubmissionCompilationErrorException(Exception(aggregateError))
+                        context.Fail(ex, aggregateError)
+                    | Error ex ->
+                        context.Fail(ex, null)
                 else
                     context.Fail(null, "Command cancelled")
         }
@@ -117,8 +148,16 @@ type FSharpKernelBase () as this =
             let! declarationItems = script.Value.GetCompletionItems(requestCompletions.Code, requestCompletions.LinePosition.Line + 1, requestCompletions.LinePosition.Character)
             let completionItems =
                 declarationItems
-                |> Array.map completionItem
+                |> Array.map getCompletionItem
             context.Publish(CompletionsProduced(completionItems, requestCompletions))
+        }
+
+    let handleRequestDiagnostics (requestDiagnostics: RequestDiagnostics) (context: KernelInvocationContext) =
+        async {
+            let! (_parseResults, checkFileResults, _checkProjectResults) = script.Value.Fsi.ParseAndCheckInteraction(requestDiagnostics.Code)
+            let errors = checkFileResults.Errors
+            let diagnostics = errors |> Array.map getDiagnostic |> fun x -> x.ToImmutableArray()
+            context.Publish(DiagnosticsProduced(diagnostics, requestDiagnostics))
         }
 
     let createPackageRestoreContext registerForDisposal =
@@ -132,6 +171,11 @@ type FSharpKernelBase () as this =
         script.Value.Fsi.GetBoundValues()
         |> List.filter (fun x -> x.Name <> "it") // don't report special variable `it`
         |> List.map (fun x -> CurrentVariable(x.Name, x.Value.ReflectionType, x.Value.ReflectionValue))
+
+    override _.GetVariableNames() =
+        this.GetCurrentVariables()
+        |> List.map (fun x -> x.Name)
+        :> IReadOnlyCollection<string>
 
     override _.TryGetVariable<'a>(name: string, [<Out>] value: 'a byref) =
         match script.Value.Fsi.TryFindBoundValue(name) with
@@ -155,6 +199,9 @@ type FSharpKernelBase () as this =
 
     // ideally via IKernelCommandHandler<RequestCompletion>, but requires https://github.com/dotnet/fsharp/pull/2867
     member _.HandleRequestCompletionAsync(command: RequestCompletions, context: KernelInvocationContext) = handleRequestCompletions command context |> Async.StartAsTask :> Task
+
+    // ideally via IKernelCommandHandler<RequestDiagnostics, but requires https://github.com/dotnet/fsharp/pull/2867
+    member _.HandleRequestDiagnosticsAsync(command: RequestDiagnostics, context: KernelInvocationContext) = handleRequestDiagnostics command context |> Async.StartAsTask :> Task
 
     // ideally via IKernelCommandHandler<SubmitCode, but requires https://github.com/dotnet/fsharp/pull/2867
     member _.HandleSubmitCodeAsync(command: SubmitCode, context: KernelInvocationContext) = handleSubmitCode command context |> Async.StartAsTask :> Task

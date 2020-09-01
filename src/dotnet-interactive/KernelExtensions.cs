@@ -20,7 +20,7 @@ namespace Microsoft.DotNet.Interactive.App
 {
     public static class KernelExtensions
     {
-        public static T UseQuiCommand<T>(this T kernel, IDisposable disposeOnQuit, CancellationToken cancellationToken) where T : Kernel
+        public static T UseQuitCommand<T>(this T kernel, IDisposable disposeOnQuit, CancellationToken cancellationToken) where T : Kernel
         {
             Quit.DisposeOnQuit = disposeOnQuit;
             KernelCommandEnvelope.RegisterCommandType<Quit>(nameof(Quit));
@@ -42,7 +42,7 @@ namespace Microsoft.DotNet.Interactive.App
 
             kernel.AddDirective(about);
 
-            Formatter<VersionSensor.BuildInfo>.Register((info, writer) =>
+            Formatter.Register<VersionSensor.BuildInfo>((info, writer) =>
             {
                 var url = "https://github.com/dotnet/interactive";
                 var encodedImage = string.Empty;
@@ -81,7 +81,7 @@ namespace Microsoft.DotNet.Interactive.App
         public static T UseXplot<T>(this T kernel)
             where T : Kernel
         {
-            Formatter<PlotlyChart>.Register(
+            Formatter.Register<PlotlyChart>(
                 (chart, writer) => writer.Write(PlotlyChartExtensions.GetHtml(chart)),
                 HtmlFormatter.MimeType);
 

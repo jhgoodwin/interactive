@@ -10,6 +10,7 @@ using System.CommandLine.Parsing;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+
 using Microsoft.CodeAnalysis.Text;
 using Microsoft.DotNet.Interactive.Commands;
 using Microsoft.DotNet.Interactive.Events;
@@ -22,9 +23,6 @@ namespace Microsoft.DotNet.Interactive.Parsing
         private Parser _directiveParser;
         private RootCommand _rootCommand;
 
-        public IReadOnlyList<ICommand> Directives => _rootCommand?.Children.OfType<ICommand>().ToArray() ?? Array.Empty<ICommand>();
-        public string KernelLanguage { get; internal set; }
-
         public SubmissionParser(Kernel kernel)
         {
             _kernel = kernel ?? throw new ArgumentNullException(nameof(kernel));
@@ -34,6 +32,10 @@ namespace Microsoft.DotNet.Interactive.Parsing
                 _ => kernel.Name
             };
         }
+
+        public IReadOnlyList<ICommand> Directives => _rootCommand?.Children.OfType<ICommand>().ToArray() ?? Array.Empty<ICommand>();
+
+        public string KernelLanguage { get; internal set; }
 
         public PolyglotSyntaxTree Parse(string code, string language = null)
         {
@@ -48,15 +50,40 @@ namespace Microsoft.DotNet.Interactive.Parsing
             return parser.Parse();
         }
 
-        public IReadOnlyList<KernelCommand> SplitSubmission(SubmitCode submitCode) 
+        public IReadOnlyList<KernelCommand> SplitSubmission(SubmitCode submitCode) =>
+            SplitSubmission(
+                submitCode,
+                submitCode.Code,
+                (languageNode, parent, kernelNameNode) => new SubmitCode(languageNode, submitCode.SubmissionType, parent, kernelNameNode));
+
+        public IReadOnlyList<KernelCommand> SplitSubmission(RequestDiagnostics requestDiagnostics)
+        {
+            var commands = SplitSubmission(
+                   requestDiagnostics,
+                   requestDiagnostics.Code,
+                   (languageNode, parent, _) => new RequestDiagnostics(languageNode, parent));
+            
+            return commands.Where(c => c is RequestDiagnostics ).ToList();
+        }
+
+        private delegate KernelCommand CreateChildCommand(
+            LanguageNode languageNode,
+            KernelCommand parentCommand,
+            KernelNameDirectiveNode kernelNameDirectiveNode);
+
+        private IReadOnlyList<KernelCommand> SplitSubmission(
+            KernelCommand originalCommand,
+            string code,
+            CreateChildCommand createCommand)
         {
             var commands = new List<KernelCommand>();
             var nugetRestoreOnKernels = new HashSet<string>();
             var hoistedCommandsIndex = 0;
 
-            var tree = Parse(submitCode.Code, submitCode.TargetKernelName);
+            var tree = Parse(code, originalCommand.TargetKernelName);
             var nodes = tree.GetRoot().ChildNodes.ToArray();
-            var targetKernelName = submitCode.TargetKernelName ?? KernelLanguage;
+            var targetKernelName = originalCommand.TargetKernelName ?? KernelLanguage;
+            KernelNameDirectiveNode lastKernelNameNode = null;
 
             foreach (var node in nodes)
             {
@@ -67,29 +94,37 @@ namespace Microsoft.DotNet.Interactive.Parsing
 
                         if (parseResult.Errors.Any())
                         {
-                            commands.Clear();
-                            commands.Add(
-                                new AnonymousKernelCommand((kernelCommand, context) =>
-                                {
-                                    var message =
-                                        string.Join(Environment.NewLine,
-                                                    parseResult.Errors
-                                                               .Select(e => e.ToString()));
+                            if (directiveNode.IsUnknownActionDirective())
+                            {
+                                commands.Add(createCommand(directiveNode, originalCommand, lastKernelNameNode));
+                            }
+                            else
+                            {
+                                commands.Clear();
+                                commands.Add(
+                                    new AnonymousKernelCommand((kernelCommand, context) =>
+                                    {
+                                        var message =
+                                            string.Join(Environment.NewLine,
+                                                parseResult.Errors
+                                                    .Select(e => e.ToString()));
 
-                                    context.Fail(message: message);
-                                    return Task.CompletedTask;
-                                }, parent: submitCode.Parent));
+                                        context.Fail(message: message);
+                                        return Task.CompletedTask;
+                                    }, parent: originalCommand));
+                            }
                             break;
                         }
 
                         var directiveCommand = new DirectiveCommand(
                             parseResult,
-                            submitCode.Parent,
+                            originalCommand,
                             directiveNode);
 
                         if (directiveNode is KernelNameDirectiveNode kernelNameNode)
                         {
                             targetKernelName = kernelNameNode.KernelName;
+                            lastKernelNameNode = kernelNameNode;
                         }
 
                         if (parseResult.CommandResult.Command.Name == "#r")
@@ -98,11 +133,7 @@ namespace Microsoft.DotNet.Interactive.Parsing
 
                             if (value.Value is FileInfo)
                             {
-                                AddHoistedCommand(
-                                    new SubmitCode(
-                                        directiveNode,
-                                        submitCode.SubmissionType,
-                                        submitCode.Parent));
+                                AddHoistedCommand(createCommand(directiveNode, originalCommand, lastKernelNameNode));
                             }
                             else
                             {
@@ -123,12 +154,9 @@ namespace Microsoft.DotNet.Interactive.Parsing
                         break;
 
                     case LanguageNode languageNode:
-                        commands.Add(new SubmitCode(
-                                         languageNode,
-                                         submitCode.SubmissionType,
-                                         submitCode.Parent));
+                        commands.Add(createCommand(languageNode, originalCommand, lastKernelNameNode));
                         break;
-                    
+
                     default:
                         throw new ArgumentOutOfRangeException(nameof(node));
                 }
@@ -138,11 +166,11 @@ namespace Microsoft.DotNet.Interactive.Parsing
             {
                 var kernel = _kernel.FindKernel(kernelName);
 
-                if (kernel?.SubmissionParser.GetDirectiveParser() is {} parser)
+                if (kernel?.SubmissionParser.GetDirectiveParser() is { } parser)
                 {
                     var restore = new DirectiveCommand(
                         parser.Parse("#!nuget-restore"),
-                        submitCode.Parent);
+                        originalCommand);
                     AddHoistedCommand(restore);
                 }
             }
@@ -152,11 +180,9 @@ namespace Microsoft.DotNet.Interactive.Parsing
                 return originalSubmission;
             }
 
-            var parent = submitCode.Parent ?? submitCode;
-
             foreach (var command in commands)
             {
-                command.Parent = parent;
+                command.Parent = originalCommand;
             }
 
             return commands;
@@ -170,7 +196,7 @@ namespace Microsoft.DotNet.Interactive.Parsing
             {
                 if (commands.Count == 0)
                 {
-                    splitSubmission = new[] { submitCode };
+                    splitSubmission = new[] { originalCommand };
                     return true;
                 }
 
@@ -178,9 +204,9 @@ namespace Microsoft.DotNet.Interactive.Parsing
                 {
                     if (commands[0] is SubmitCode sc)
                     {
-                        if (submitCode.Code.Equals(sc.Code, StringComparison.Ordinal))
+                        if (code.Equals(sc.Code, StringComparison.Ordinal))
                         {
-                            splitSubmission = new[] { submitCode };
+                            splitSubmission = new[] { originalCommand };
                             return true;
                         }
                     }
@@ -198,11 +224,24 @@ namespace Microsoft.DotNet.Interactive.Parsing
                 return null;
             }
 
-            return compositeKernel
-                   .ChildKernels
-                   .ToDictionary(
-                       child => child.Name,
-                       child => new Func<Parser>(() => child.SubmissionParser.GetDirectiveParser()));
+            var dict = new Dictionary<string, Func<Parser>>();
+
+            for (var i = 0; i < compositeKernel.ChildKernels.Count; i++)
+            {
+                var childKernel = compositeKernel.ChildKernels[i];
+
+                if (childKernel.ChooseKernelDirective is { } chooseKernelDirective)
+                {
+                    foreach (var alias in chooseKernelDirective.Aliases)
+                    {
+                        dict.Add(alias[2..], GetParser);
+                    }
+                }
+
+                Parser GetParser() => childKernel.SubmissionParser.GetDirectiveParser();
+            }
+
+            return dict;
         }
 
         internal Parser GetDirectiveParser()
@@ -253,7 +292,7 @@ namespace Microsoft.DotNet.Interactive.Parsing
 
             _rootCommand.Add(command);
 
-            _directiveParser = null;
+            ResetParser();
         }
 
         internal void ResetParser()
@@ -270,10 +309,9 @@ namespace Microsoft.DotNet.Interactive.Parsing
 
             var kind = symbol switch
             {
-                IArgument _ => "Value",
                 IOption _ => "Property",
                 ICommand _ => "Method",
-                _ => null
+                _ => "Value"
             };
 
             var helpBuilder = new DirectiveHelpBuilder(
@@ -286,15 +324,15 @@ namespace Microsoft.DotNet.Interactive.Parsing
                 filterText: name,
                 sortText: name,
                 insertText: name,
-                documentation: helpBuilder.GetHelpForSymbol(symbol));
+                documentation:
+                symbol != null
+                    ? helpBuilder.GetHelpForSymbol(symbol)
+                    : null);
         }
 
         private void EnsureRootCommandIsInitialized()
         {
-            if (_rootCommand == null)
-            {
-                _rootCommand = new RootCommand();
-            }
+            _rootCommand ??= new RootCommand();
         }
     }
 }

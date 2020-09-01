@@ -5,10 +5,11 @@ using System;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.DotNet.Interactive.App.CommandLine;
 using Microsoft.DotNet.Interactive.App.Http;
+using Microsoft.DotNet.Interactive.Commands;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Hosting;
+using Pocket;
 
 namespace Microsoft.DotNet.Interactive.App
 {
@@ -34,9 +35,11 @@ namespace Microsoft.DotNet.Interactive.App
 
         public void ConfigureServices(IServiceCollection services)
         {
+            using var _ = Logger.Log.OnEnterAndExit();
+
             if (StartupOptions.EnableHttpApi)
             {
-                services.AddSingleton((c) => new KernelHubConnection(c.GetRequiredService<CompositeKernel>()));
+                services.AddSingleton(c => new KernelHubConnection(c.GetRequiredService<CompositeKernel>()));
                 services.AddRouting();
                 services.AddCors(options =>
                 {
@@ -59,25 +62,40 @@ namespace Microsoft.DotNet.Interactive.App
             IHostApplicationLifetime lifetime,
             IServiceProvider serviceProvider)
         {
+            var operation = Logger.Log.OnEnterAndExit();
             if (StartupOptions.EnableHttpApi)
             {
+                var kernel = serviceProvider.GetRequiredService<Kernel>();
                 app.UseStaticFiles(new StaticFileOptions
                 {
-                    FileProvider = new EmbeddedFileProvider(typeof(Startup).Assembly)
+                    FileProvider = new FileProvider(kernel)
                 });
                 app.UseWebSockets();
                 app.UseCors("default");
                 app.UseRouting();
                 app.UseRouter(r =>
                 {
+                    operation.Info("configuring routing");
                     var frontendEnvironment = serviceProvider.GetService<HtmlNotebookFrontedEnvironment>();
                     if (frontendEnvironment != null)
                     {
                         r.Routes.Add(new DiscoveryRouter(frontendEnvironment));
                     }
 
-                    r.Routes.Add(new VariableRouter(serviceProvider.GetRequiredService<Kernel>()));
-                    r.Routes.Add(new KernelsRouter(serviceProvider.GetRequiredService<Kernel>()));
+                   
+                    var startupOptions = serviceProvider.GetRequiredService<StartupOptions>();
+                    if (startupOptions.EnableHttpApi)
+                    {
+                        var httpProbingSettings = serviceProvider.GetRequiredService<HttpProbingSettings>();
+
+                        kernel = kernel.UseHttpApi(startupOptions, httpProbingSettings);
+                        var enableHttp = new SubmitCode("#!enable-http", kernel.Name);
+                        enableHttp.PublishInternalEvents();
+                        kernel.DeferCommand(enableHttp);
+                    }
+
+                    r.Routes.Add(new VariableRouter(kernel));
+                    r.Routes.Add(new KernelsRouter(kernel));
                 });
                 app.UseEndpoints(endpoints =>
                 {

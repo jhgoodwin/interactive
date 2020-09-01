@@ -3,16 +3,23 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
+
 using Assent;
+
 using FluentAssertions;
+
 using Microsoft.AspNetCore.Html;
+using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
 using Microsoft.DotNet.Interactive.Commands;
 using Microsoft.DotNet.Interactive.Events;
+using Microsoft.DotNet.Interactive.Notebook;
 using Microsoft.DotNet.Interactive.Server;
-using Microsoft.DotNet.Interactive.Utility;
+
 using Pocket;
+
 using Xunit;
 using Xunit.Abstractions;
 
@@ -70,7 +77,7 @@ namespace Microsoft.DotNet.Interactive.Tests.Server
         {
             var _configuration = new Configuration()
                                  .UsingExtension($"{command.GetType().Name}.json")
-                                 .SetInteractive(false);
+                                 .SetInteractive(Debugger.IsAttached);
 
             command.SetToken("the-token");
 
@@ -85,7 +92,7 @@ namespace Microsoft.DotNet.Interactive.Tests.Server
         {
             var _configuration = new Configuration()
                                  .UsingExtension($"{@event.GetType().Name}.json")
-                                 .SetInteractive(false);
+                                 .SetInteractive(Debugger.IsAttached);
 
             @event.Command?.SetToken("the-token");
 
@@ -145,11 +152,30 @@ namespace Microsoft.DotNet.Interactive.Tests.Server
                     new FormattedValue("text/html", "<b>hi!</b>")
                 );
 
+                yield return new ParseNotebook("notebook.ipynb", new byte[] { 0x01, 0x02, 0x03, 0x04 });
+
                 yield return new RequestCompletions("Cons", new LinePosition(0, 4), "csharp");
 
-                yield return new RequestDiagnostics();
+                yield return new RequestDiagnostics("the-code");
 
                 yield return new RequestHoverText("document-contents", new LinePosition(1, 2));
+
+                yield return new SerializeNotebook("notebook.ipynb", new NotebookDocument(new[]
+                {
+                    new NotebookCell("language", "contents", new NotebookCellOutput[]
+                    {
+                        new NotebookCellDisplayOutput(new Dictionary<string, object>()
+                        {
+                            { "text/html", "<b></b>" }
+                        }),
+                        new NotebookCellTextOutput("text"),
+                        new NotebookCellErrorOutput("e-name", "e-value", new[]
+                        {
+                            "at func1()",
+                            "at func2()"
+                        })
+                    })
+                }), "\r\n");
 
                 yield return new SubmitCode("123", "csharp", SubmissionType.Run);
 
@@ -203,6 +229,19 @@ namespace Microsoft.DotNet.Interactive.Tests.Server
 
                 yield return new DiagnosticLogEntryProduced("oops!", submitCode);
 
+                yield return new DiagnosticsProduced(
+                    new[]
+                    {
+                        new Diagnostic(
+                            new LinePositionSpan(
+                                new LinePosition(1, 2),
+                                new LinePosition(3, 4)),
+                            DiagnosticSeverity.Error,
+                            "code",
+                            "message")
+                    },
+                    submitCode);
+
                 yield return new DisplayedValueProduced(
                     new HtmlString("<b>hi!</b>"),
                     new SubmitCode("b(\"hi!\")", "csharp", SubmissionType.Run),
@@ -234,6 +273,25 @@ namespace Microsoft.DotNet.Interactive.Tests.Server
                     new LinePositionSpan(new LinePosition(1, 2), new LinePosition(3, 4)));
 
                 yield return new KernelReady();
+
+                yield return new NotebookParsed(new NotebookDocument(new[]
+                {
+                    new NotebookCell("language", "contents", new NotebookCellOutput[]
+                    {
+                        new NotebookCellDisplayOutput(new Dictionary<string, object>()
+                        {
+                            { "text/html", "<b></b>" }
+                        }),
+                        new NotebookCellTextOutput("text"),
+                        new NotebookCellErrorOutput("e-name", "e-value", new[]
+                        {
+                            "at func1()",
+                            "at func2()"
+                        })
+                    })
+                }));
+
+                yield return new NotebookSerialized(new byte[] { 0x01, 0x02, 0x03, 0x04 });
 
                 yield return new PackageAdded(
                     new ResolvedPackageReference(
@@ -270,6 +328,8 @@ namespace Microsoft.DotNet.Interactive.Tests.Server
                 yield return new WorkingDirectoryChanged(
                     "some/different/directory",
                     new ChangeWorkingDirectory("some/different/directory"));
+
+                yield return new KernelExtensionLoaded(new SubmitCode(@"#r ""nuget:package"" "));
             }
         }
 

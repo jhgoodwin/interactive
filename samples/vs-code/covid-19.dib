@@ -10,7 +10,7 @@ Also, due to travel restrictions, you should run this at home on isolated comput
 
 Since Johns Hopkins has put COVID-19 time series data on [GitHub](https://github.com/CSSEGISandData/COVID-19), let's take a look at it. We can download it using PowerShell:
 
-#!powershell
+#!pwsh
 
 Invoke-WebRequest -Uri "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_confirmed_global.csv" -OutFile "./Confirmed.csv"
 Invoke-WebRequest -Uri "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_deaths_global.csv" -OutFile "./Deaths.csv"
@@ -88,7 +88,7 @@ displayedValue.Update("Ready.");
 
 #!markdown
 
-Because we've stored our data in top-level variables (`deathsSeries`, `confirmedSeries`, `recoveredSeries`, etc.) in the C# kernel, they're accessible from JavaScript by calling `interactive.csharp.getVariable`. The data will be returned as JSON and we can plot it using the library of our choice, pulled in using [RequireJS](https://requirejs.org/). 
+Because we've stored our data in the top-level variable `series` in the C# kernel, it is accessible from JavaScript by calling `interactive.csharp.getVariable`. The data will be returned as JSON and we can plot it using the library of our choice, pulled in using [RequireJS](https://requirejs.org/). 
 
 We'll use [Plotly](https://plot.ly/).
 

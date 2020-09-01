@@ -2,6 +2,9 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 using System;
+using System.Collections.Generic;
+using System.CommandLine;
+using System.CommandLine.Invocation;
 using System.Linq;
 using System.Reactive.Linq;
 using System.Threading.Tasks;
@@ -138,8 +141,9 @@ location.EndsWith(""System.Text.Json.dll"")"
 |> List.sum";
 
             await SubmitCode(kernel, source);
+            var events = KernelEvents;
 
-            KernelEvents
+            events
                 .OfType<ReturnValueProduced>()
                 .Last()
                 .Value
@@ -246,9 +250,9 @@ f();"
         }
 
         [Theory]
-        [InlineData(Language.CSharp)]
-        [InlineData(Language.FSharp)]
-        public async Task it_returns_diagnostics(Language language)
+        [InlineData(Language.CSharp, "CS0103", "The name 'aaaadd' does not exist in the current context", "(1,1): error CS0103: The name 'aaaadd' does not exist in the current context")]
+        [InlineData(Language.FSharp, "FS0039", "The value or constructor 'aaaadd' is not defined.", "input.fsx (1,1)-(1,7) typecheck error The value or constructor 'aaaadd' is not defined.")]
+        public async Task when_code_contains_compile_time_error_diagnostics_are_produced(Language language, string code, string diagnosticMessage, string errorMessage)
         {
             var kernel = CreateKernel(language);
 
@@ -269,19 +273,393 @@ f();"
 
             await SubmitCode(kernel, source);
 
-            var error = language switch
-            {
-                Language.FSharp => "input.fsx (1,1)-(1,7) typecheck error The value or constructor 'aaaadd' is not defined.",
-                Language.CSharp => "(1,1): error CS0103: The name 'aaaadd' does not exist in the current context"
-            };
+            var diagnosticRange = new LinePositionSpan(
+                new LinePosition(0, 0),
+                new LinePosition(0, 6));
 
+            using var _ = new AssertionScope();
+
+            // The CommandFailed message is populated
             KernelEvents
                 .Should()
                 .ContainSingle<CommandFailed>()
                 .Which
                 .Message
                 .Should()
-                .Be(error);
+                .Be(errorMessage);
+
+            // The Diagnostics of DiagnosticsProduced event are populated
+            KernelEvents
+                .Should()
+                .ContainSingle<DiagnosticsProduced>(d => d.Diagnostics.Count > 0)
+                .Which
+                .Diagnostics
+                .Should()
+                .ContainSingle(diag => 
+                    diag.LinePositionSpan == diagnosticRange && 
+                    diag.Code == code && 
+                    diag.Message == diagnosticMessage);
+
+            // The FormattedValues are populated of DiagnosticsProduced event are populated
+            KernelEvents
+                .Should()
+                .ContainSingle<DiagnosticsProduced>(d => d.Diagnostics.Count > 0)
+                .Which
+                .FormattedDiagnostics
+                .Should()
+                .ContainSingle(fv => true)
+                .Which
+                .Value
+                .Should()
+                .Be(errorMessage);
+
+        }
+
+        [Theory]
+        [InlineData(Language.CSharp, "'AppDomain.GetCurrentThreadId()' is obsolete: 'AppDomain.GetCurrentThreadId has been deprecated")]
+        [InlineData(Language.FSharp, "This construct is deprecated. AppDomain.GetCurrentThreadId has been deprecated")]
+        public async Task when_code_contains_compile_time_warnings_diagnostics_are_produced(Language language, string diagnosticMessage)
+        {
+            var kernel = CreateKernel(language);
+
+            var source = language switch
+            {
+                Language.FSharp => new[]
+                {
+                    "System.AppDomain.GetCurrentThreadId()"
+                },
+
+                Language.CSharp => new[]
+                {
+                    "System.AppDomain.GetCurrentThreadId()",
+                }
+            };
+
+            await SubmitCode(kernel, source);
+
+            using var _ = new AssertionScope();
+
+            KernelEvents
+                .Should()
+                .ContainSingle<ReturnValueProduced>();
+
+            KernelEvents
+                .Should()
+                .ContainSingle<DiagnosticsProduced>(d => d.Diagnostics.Count > 0)
+                .Which
+                .Diagnostics
+                .Should()
+                .ContainSingle(diagnostic => true)
+                .Which
+                .Message
+                .Should()
+                .StartWith(diagnosticMessage);
+        }
+
+        [Fact]
+        public async Task powershell_produces_diagnostics_from_parse_errors()
+        {
+            var kernel = CreateKernel(Language.PowerShell);
+
+            await kernel.SubmitCodeAsync("::()");
+
+            var diagnosticRange = new LinePositionSpan(
+                new LinePosition(0, 4),
+                new LinePosition(0, 4));
+
+            KernelEvents
+                .Should()
+                .ContainSingle<DiagnosticsProduced>(d => d.Diagnostics.Count > 0)
+                .Which
+                .Diagnostics
+                .Should()
+                .ContainSingle(d =>
+                    d.LinePositionSpan == diagnosticRange &&
+                    d.Code == "ExpectedExpression" && 
+                    d.Message == "An expression was expected after '('.");
+
+            KernelEvents
+                .Should()
+                .ContainSingle<DiagnosticsProduced>(d => d.Diagnostics.Count > 0)
+                .Which
+                .FormattedDiagnostics
+                .Should()
+                .ContainSingle(fv => true)
+                .Which
+                .Value
+                .Should()
+                .StartWith("At line:1 char:4");
+        }
+
+        [Theory]
+        [InlineData(Language.CSharp, @"
+int SomeFunction(int n)
+{
+    return n switch
+    {
+        0 => 0
+    };
+}
+
+", "The switch expression does not handle all possible values of its input type")]
+        [InlineData(Language.FSharp, @"
+let x n =
+    match n with
+    | 0 -> ()
+", "Incomplete pattern matches on this expression.")]
+        public async Task diagnostics_are_produced_on_command_succeeded(Language language, string code, string diagnosticText)
+        {
+            var kernel = CreateKernel(language);
+
+            await kernel.SubmitCodeAsync(code);
+
+            using var _ = new AssertionScope();
+
+            KernelEvents
+                .Should()
+                .ContainSingle<CommandSucceeded>();
+
+            KernelEvents
+                .Should()
+                .ContainSingle<DiagnosticsProduced>(d => d.Diagnostics.Count > 0)
+                .Which
+                .Diagnostics
+                .Should()
+                .ContainSingle(diag => diag.Message.Contains(diagnosticText));
+        }
+
+        [Fact(Skip = "The first failed sub-command cancels all subsequent command executions; the second kernel doesn't get a chance to report.")]
+        public async Task diagnostics_can_be_produced_from_multiple_subkernels()
+        {
+            var kernel = CreateCompositeKernel(Language.FSharp);
+
+            var code = @"
+#!fsharp
+printfnnn """"
+
+#!csharp
+Console.WriteLin();
+";
+
+            await SubmitCode(kernel, code);
+
+            KernelEvents
+                .OfType<DiagnosticsProduced>()
+                .SelectMany(dp => dp.Diagnostics)
+                .Should()
+                .ContainSingle(d => d.Code.StartsWith("CS"))
+                .And
+                .ContainSingle(d => d.Code.StartsWith("FS"));
+        }
+
+        [Theory]
+        [InlineData(Language.CSharp)]
+        [InlineData(Language.FSharp)]
+        public async Task shadowing_variable_does_not_produce_diagnostics(Language language)
+        {
+            var kernel = CreateKernel(language);
+
+            var firstDeclaration = language switch
+            {
+                // null returned.
+                Language.FSharp => "let a = \"original\"",
+                Language.CSharp => "var a = \"original\";"
+            };
+
+            await SubmitCode(kernel, firstDeclaration);
+
+            var shadowingDeclaration = language switch
+            {
+                // null returned.
+                Language.FSharp => "let a = 1",
+                Language.CSharp => "var a = 1;"
+            };
+
+            await SubmitCode(kernel, shadowingDeclaration);
+
+            KernelEvents
+                .OfType<DiagnosticsProduced>()
+                .SelectMany(dp => dp.Diagnostics)
+                .Should()
+                .BeEmpty();
+        }
+
+        [Theory]
+        [InlineData(Language.CSharp)]
+        [InlineData(Language.FSharp)]
+        public async Task accessing_shadowed_variable_does_not_produce_diagnostics(Language language)
+        {
+            var kernel = CreateKernel(language);
+
+            var firstDeclaration = language switch
+            {
+                // null returned.
+                Language.FSharp => "let a = \"original\"",
+                Language.CSharp => "var a = \"original\";"
+            };
+
+            await SubmitCode(kernel, firstDeclaration);
+
+            var shadowingDeclaration = language switch
+            {
+                // null returned.
+                Language.FSharp => "let a = 1",
+                Language.CSharp => "var a = 1;"
+            };
+
+            await SubmitCode(kernel, shadowingDeclaration);
+
+            await SubmitCode(kernel, "a");
+
+            KernelEvents
+                .OfType<DiagnosticsProduced>()
+                .SelectMany(dp => dp.Diagnostics)
+                .Should()
+                .BeEmpty();
+        }
+
+        [Theory]
+        [InlineData(Language.CSharp)]
+        [InlineData(Language.FSharp)]
+        public async Task typing_shadowed_variable_does_not_produce_diagnostics(Language language)
+        {
+            var kernel = CreateKernel(language);
+
+            var firstDeclaration = language switch
+            {
+                // null returned.
+                Language.FSharp => "let a = \"original\"",
+                Language.CSharp => "var a = \"original\";"
+            };
+
+            await SubmitCode(kernel, firstDeclaration);
+
+            var shadowingDeclaration = language switch
+            {
+                // null returned.
+                Language.FSharp => "let a = 1",
+                Language.CSharp => "var a = 1;"
+            };
+
+            await SubmitCode(kernel, shadowingDeclaration);
+
+            await kernel.SendAsync(new RequestDiagnostics("a"));
+
+            KernelEvents
+                .OfType<DiagnosticsProduced>()
+                .SelectMany(dp => dp.Diagnostics)
+                .Should()
+                .BeEmpty();
+        }
+
+        [Theory]
+        [InlineData(Language.CSharp, "Console.WritLin();")]
+        [InlineData(Language.FSharp, "printfnnn \"\"")]
+        [InlineData(Language.PowerShell, "::()")]
+        public async Task produced_diagnostics_are_remapped_to_the_appropriate_span(Language language, string languageSpecificCode)
+        {
+            var kernel = CreateKernel(language);
+
+            var fullCode = $@"
+
+#!time
+
+$${languageSpecificCode}
+";
+
+            MarkupTestFile.GetLineAndColumn(fullCode, out var code, out var line, out var _column);
+
+            await SubmitCode(kernel, code);
+
+            KernelEvents
+                .Should()
+                .ContainSingle<DiagnosticsProduced>(d => d.Diagnostics.Count > 0)
+                .Which
+                .Diagnostics
+                .Should()
+                .ContainSingle()
+                .Which
+                .LinePositionSpan.Start.Line
+                .Should()
+                .Be(line);
+        }
+
+        [Theory]
+        [InlineData(Language.CSharp, "Console.WriteLineeeeeee();", "CS0117")]
+        [InlineData(Language.FSharp, "printfnnnnnn \"\"", "FS0039")]
+        [InlineData(Language.PowerShell, "::()", "ExpectedExpression")]
+        public async Task diagnostics_can_be_directly_requested(Language language, string source, string diagnosticCode)
+        {
+            var kernel = CreateKernel(language);
+
+            await kernel.SendAsync(new RequestDiagnostics(source));
+
+            KernelEvents
+                .Should()
+                .ContainSingle<DiagnosticsProduced>(d => d.Diagnostics.Count == 1)
+                .Which
+                .Diagnostics
+                .Should()
+                .ContainSingle(diag => diag.Code == diagnosticCode);
+        }
+
+        [Theory]
+        [InlineData(Language.CSharp, "Console.WriteLineeeeeee();")]
+        [InlineData(Language.FSharp, "printfnnnnnn \"\"")]
+        [InlineData(Language.PowerShell, "::()")]
+        public async Task requested_diagnostics_are_remapped_to_the_appropriate_span(Language language, string languageSpecificCode)
+        {
+            var kernel = CreateKernel(language);
+
+            var fullCode = $@"
+
+#!time
+
+$${languageSpecificCode}
+";
+
+            MarkupTestFile.GetLineAndColumn(fullCode, out var code, out var line, out var _column);
+
+            await kernel.SendAsync(new RequestDiagnostics(code));
+
+            KernelEvents
+                .Should()
+                .ContainSingle<DiagnosticsProduced>(d => d.Diagnostics.Count == 1)
+                .Which
+                .Diagnostics
+                .Should()
+                .ContainSingle(diag => diag.LinePositionSpan.Start.Line == line);
+        }
+
+        [Theory]
+        [InlineData(Language.CSharp, "Console.WriteLineeeeeee();")]
+        [InlineData(Language.FSharp, "printfnnnnnn \"\"")]
+        [InlineData(Language.PowerShell, "::()")]
+        public async Task requested_diagnostics_does_not_execute_directives_handlers(Language language, string languageSpecificCode)
+        {
+            var kernel = CreateKernel(language);
+            var handlerInvoked = false;
+            kernel.AddDirective(new Command("#!custom")
+            {
+                Handler = CommandHandler.Create(() =>
+                {
+                    handlerInvoked = true;
+                })
+            });
+            var fullCode = $@"
+
+#!time
+#!custom
+$${languageSpecificCode}
+";
+
+            MarkupTestFile.GetLineAndColumn(fullCode, out var code, out var line, out var _column);
+
+            await kernel.SendAsync(new RequestDiagnostics(code));
+
+            handlerInvoked
+                .Should()
+                .BeFalse();
         }
 
         [Theory]
@@ -560,7 +938,7 @@ Console.Write(""value three"");"
         [InlineData(Language.FSharp)]
         public async Task it_returns_a_similarly_shaped_error(Language language)
         {
-            var kernel = CreateKernel(language);
+            var kernel = CreateKernel(language, openTestingNamespaces: true);
 
             var (source, error) = language switch
             {
@@ -573,9 +951,13 @@ Console.Write(""value three"");"
 
             KernelEvents
                 .Should()
-                .ContainSingle<CommandFailed>()
+                .ContainSingle<DiagnosticsProduced>(d => d.Diagnostics.Count > 0)
                 .Which
-                .Message
+                .FormattedDiagnostics
+                .Should()
+                .ContainSingle(fv => true)
+                .Which
+                .Value
                 .Should()
                 .Be(error);
         }
@@ -734,7 +1116,7 @@ Console.Write(2);
         [InlineData(Language.PowerShell)]
         public async Task it_returns_completion_list_for_previously_declared_items(Language language)
         {
-            var kernel = CreateKernel(language);
+            var kernel = CreateKernel(language, openTestingNamespaces: true);
 
             var source = language switch
             {
@@ -790,7 +1172,7 @@ Console.Write(2);
 
             await kernel.SubmitCodeAsync(codeToSetVariable);
 
-            var languageKernel = kernel.ChildKernels.OfType<DotNetLanguageKernel>().Single();
+            var languageKernel = kernel.ChildKernels.OfType<DotNetKernel>().Single();
 
             var succeeded = languageKernel.TryGetVariable("x", out int x);
 
@@ -808,7 +1190,7 @@ Console.Write(2);
         {
             var kernel = CreateKernel(language);
 
-            var languageKernel = kernel.ChildKernels.OfType<DotNetLanguageKernel>().Single();
+            var languageKernel = kernel.ChildKernels.OfType<DotNetKernel>().Single();
 
             await languageKernel.SetVariableAsync("x", 123);
 
@@ -828,7 +1210,7 @@ Console.Write(2);
         {
             var kernel = CreateKernel(language);
 
-            var languageKernel = kernel.ChildKernels.OfType<DotNetLanguageKernel>().Single();
+            var languageKernel = kernel.ChildKernels.OfType<DotNetKernel>().Single();
 
             await languageKernel.SetVariableAsync("x", 123);
             await languageKernel.SetVariableAsync("x", 456);
@@ -849,7 +1231,7 @@ Console.Write(2);
         {
             var kernel = CreateKernel(language);
 
-            var languageKernel = kernel.ChildKernels.OfType<DotNetLanguageKernel>().Single();
+            var languageKernel = kernel.ChildKernels.OfType<DotNetKernel>().Single();
 
             await languageKernel.SetVariableAsync("x", 123);
             await languageKernel.SetVariableAsync("x", "hello");

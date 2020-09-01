@@ -17,15 +17,20 @@ namespace Microsoft.DotNet.Interactive.Server
         private readonly IOutputTextStream _output;
         private readonly CompositeDisposable _disposables;
 
-
         public KernelServer(
-            Kernel kernel, 
+            Kernel kernel,
             IInputTextStream input,
-            IOutputTextStream output)
+            IOutputTextStream output,
+            DirectoryInfo workingDir)
         {
             _kernel = kernel ?? throw new ArgumentNullException(nameof(kernel));
             _input = input ?? throw new ArgumentNullException(nameof(input));
             _output = output ?? throw new ArgumentNullException(nameof(output));
+
+            if (workingDir is null)
+            {
+                throw new ArgumentNullException(nameof(workingDir));
+            }
 
             _disposables = new CompositeDisposable
             {
@@ -37,6 +42,7 @@ namespace Microsoft.DotNet.Interactive.Server
                 _input
             };
 
+            Environment.CurrentDirectory = workingDir.FullName;
             WriteEventToOutput(new KernelReady());
         }
 
@@ -84,6 +90,14 @@ namespace Microsoft.DotNet.Interactive.Server
         public void Dispose()
         {
             _disposables.Dispose();
+        }
+
+        public void Start()
+        {
+            if (_input is InputTextStream pollingInputTextStream)
+            {
+                pollingInputTextStream.Start();
+            }
         }
     }
 }

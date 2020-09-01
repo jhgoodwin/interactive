@@ -145,14 +145,14 @@ using static {typeof(TopLevelMethods).FullName};
         private static T UseLsMagic<T>(this T kernel)
             where T : Kernel
         {
-            kernel.AddDirective(lsmagic());
+            kernel.AddDirective(lsmagic(kernel));
 
             kernel.VisitSubkernels(k =>
             {
-                k.AddDirective(lsmagic());
+                k.AddDirective(lsmagic(k));
             });
 
-            Formatter<SupportedDirectives>.Register((directives, writer) =>
+            Formatter.Register<SupportedDirectives>((directives, writer) =>
             {
                 var indentLevel = 1.5;
                 PocketView t = div(
@@ -164,10 +164,13 @@ using static {typeof(TopLevelMethods).FullName};
                 IEnumerable<IHtmlContent> Summary(ICommand command, double offset)
                 {
                     yield return new HtmlString("<pre>");
+
                     var level = indentLevel + offset;
-                    for (var i = 0; i < command.Aliases.Count; i++)
+
+                    for (var i = 0; i < command.Aliases.ToArray().Length; i++)
                     {
-                        yield return span[style: $"text-indent:{level:##.#}em; color:#512bd4"](command.Aliases[i]);
+                        var alias = command.Aliases.ToArray()[i];
+                        yield return span[style: $"text-indent:{level:##.#}em; color:#512bd4"](alias);
 
                         if (i < command.Aliases.Count - 1)
                         {
@@ -191,14 +194,12 @@ using static {typeof(TopLevelMethods).FullName};
             return kernel;
         }
 
-        private static Command lsmagic()
+        private static Command lsmagic(Kernel kernel)
         {
             return new Command("#!lsmagic", "List the available magic commands / directives")
             {
                 Handler = CommandHandler.Create(async (KernelInvocationContext context) =>
                 {
-                    var kernel = context.CurrentKernel;
-
                     var supportedDirectives = new SupportedDirectives(kernel.Name);
 
                     supportedDirectives.Commands.AddRange(
@@ -210,7 +211,7 @@ using static {typeof(TopLevelMethods).FullName};
                     {
                         if (k.Directives.Any(d => d.Name == "#!lsmagic"))
                         {
-                            await k.SendAsync(new SubmitCode(((SubmitCode)context.Command).Code));
+                            await k.SendAsync(new SubmitCode(((SubmitCode) context.Command).Code));
                         }
                     });
                 })

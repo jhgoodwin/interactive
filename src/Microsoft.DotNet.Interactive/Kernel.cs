@@ -6,7 +6,6 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.CommandLine;
 using System.CommandLine.Parsing;
-using System.IO;
 using System.Linq;
 using System.Reactive;
 using System.Reactive.Disposables;
@@ -27,10 +26,11 @@ namespace Microsoft.DotNet.Interactive
         private readonly Subject<KernelEvent> _kernelEvents = new Subject<KernelEvent>();
         private readonly CompositeDisposable _disposables;
         private readonly ConcurrentQueue<KernelCommand> _deferredCommands = new ConcurrentQueue<KernelCommand>();
-        private readonly ConcurrentDictionary<Type, object> _properties = new ConcurrentDictionary<Type, object>();
+
         private readonly ConcurrentQueue<KernelOperation> _commandQueue =
             new ConcurrentQueue<KernelOperation>();
         private FrontendEnvironment _frontendEnvironment;
+        private ChooseKernelDirective _chooseKernelDirective;
 
         protected Kernel(string name)
         {
@@ -60,7 +60,7 @@ namespace Microsoft.DotNet.Interactive
 
         internal KernelCommandPipeline Pipeline { get; }
 
-        internal CompositeKernel ParentKernel { get; set; }
+        public CompositeKernel ParentKernel { get; internal set; }
 
         public SubmissionParser SubmissionParser { get; }
 
@@ -75,6 +75,7 @@ namespace Microsoft.DotNet.Interactive
                 throw new ArgumentNullException(nameof(command));
             }
 
+            command.SetToken($"deferredCommand::{Guid.NewGuid():N}");
             _deferredCommands.Enqueue(command);
         }
 
@@ -105,7 +106,7 @@ namespace Microsoft.DotNet.Interactive
             AddMiddleware(
                 async (originalCommand, context, next) =>
                 {
-                    var commands = PreprocessCommands(originalCommand, context);
+                    var commands = PreprocessCommands(originalCommand);
 
                     if (!commands.Contains(originalCommand) && commands.Any())
                     {
@@ -152,12 +153,15 @@ namespace Microsoft.DotNet.Interactive
                 });
         }
 
-        private IReadOnlyList<KernelCommand> PreprocessCommands(KernelCommand command, KernelInvocationContext context)
+        private IReadOnlyList<KernelCommand> PreprocessCommands(KernelCommand command)
         {
             return command switch
             {
                 SubmitCode submitCode
                 when submitCode.LanguageNode is null => SubmissionParser.SplitSubmission(submitCode),
+
+                RequestDiagnostics requestDiagnostics
+                when requestDiagnostics.LanguageNode is null => SubmissionParser.SplitSubmission(requestDiagnostics),
 
                 LanguageServiceCommand languageServiceCommand
                 when languageServiceCommand.LanguageNode is null => PreprocessLanguageServiceCommand(languageServiceCommand),
@@ -198,7 +202,7 @@ namespace Microsoft.DotNet.Interactive
                 offsetLanguageServiceCommand.TargetKernelName = node switch
                 {
                     DirectiveNode _ => Name,
-                    _ => node.Language,
+                    _ => node.KernelName,
                 };
 
                 commands.Add(offsetLanguageServiceCommand);
@@ -211,13 +215,7 @@ namespace Microsoft.DotNet.Interactive
         {
             SetHandlingKernel(command, context);
 
-            var previousKernel = context.CurrentKernel;
-
-            context.CurrentKernel = this;
-
             await next(command, context);
-
-            context.CurrentKernel = previousKernel;
         }
 
         public FrontendEnvironment FrontendEnvironment
@@ -394,11 +392,21 @@ namespace Microsoft.DotNet.Interactive
                                                 .Lines
                                                 .GetPosition(command.LinePosition);
 
-                var resultRange = new LinePositionSpan(
-                    new LinePosition(command.LinePosition.Line, 0),
-                    command.LinePosition);
+                var completions = GetDirectiveCompletionItems(
+                    directiveNode, 
+                    requestPosition);
+                
+                var upToCursor =
+                    directiveNode.Text[..command.LinePosition.Character];
 
-                var completions = GetDirectiveCompletionItems(directiveNode, requestPosition);
+                var indexOfPreviousSpace =
+                    Math.Max(
+                        0, 
+                        upToCursor.LastIndexOf(" ", StringComparison.CurrentCultureIgnoreCase) + 1);
+
+                var resultRange = new LinePositionSpan(
+                    new LinePosition(command.LinePosition.Line, indexOfPreviousSpace),
+                    command.LinePosition);
 
                 context.Publish(
                     new CompletionsProduced(
@@ -408,18 +416,45 @@ namespace Microsoft.DotNet.Interactive
             return Task.CompletedTask;
         }
 
-        private protected virtual IReadOnlyList<CompletionItem> GetDirectiveCompletionItems(
-            DirectiveNode directiveNode, 
+        private IReadOnlyList<CompletionItem> GetDirectiveCompletionItems(
+            DirectiveNode directiveNode,
             int requestPosition)
         {
-            var parseResult = directiveNode.GetDirectiveParseResult();
+            var directiveParsers = new List<Parser>();
 
-            var completions = parseResult
-                              .GetSuggestions(requestPosition)
-                              .Select(s => SubmissionParser.CompletionItemFor(s, parseResult))
-                              .ToArray();
+            directiveParsers.AddRange(
+                GetDirectiveParsersForCompletion(directiveNode, requestPosition));
 
-            return completions;
+            var allCompletions = new List<CompletionItem>();
+            var topDirectiveParser = SubmissionParser.GetDirectiveParser();
+            var prefix = topDirectiveParser.Configuration.RootCommand.Name + " ";
+            requestPosition += prefix.Length;
+            
+            foreach (var parser in directiveParsers)
+            {
+                var effectiveText = $"{prefix}{directiveNode.Text}";
+
+                var parseResult = parser.Parse(effectiveText);
+
+                var suggestions = parseResult.GetSuggestions(requestPosition);
+
+                var completions = suggestions
+                                  .Select(s => SubmissionParser.CompletionItemFor(s, parseResult))
+                                  .ToArray();
+
+                allCompletions.AddRange(completions);
+            }
+
+            return allCompletions
+                   .Distinct(CompletionItemComparer.Instance)
+                   .ToArray();
+        }
+
+        private protected virtual IEnumerable<Parser> GetDirectiveParsersForCompletion(
+            DirectiveNode directiveNode,
+            int requestPosition)
+        {
+            yield return SubmissionParser.GetDirectiveParser();
         }
 
         private protected void TrySetHandler(
@@ -430,6 +465,14 @@ namespace Microsoft.DotNet.Interactive
             {
                 switch (command, this)
                 {
+                    case (ParseNotebook parseNotebook, IKernelCommandHandler<ParseNotebook> parseNotebookHandler):
+                        SetHandler(parseNotebookHandler, parseNotebook);
+                        break;
+
+                    case (SerializeNotebook serializeNotebook, IKernelCommandHandler<SerializeNotebook> serializeNotebookHandler):
+                        SetHandler(serializeNotebookHandler, serializeNotebook);
+                        break;
+
                     case (SubmitCode submitCode, IKernelCommandHandler<SubmitCode> submitCodeHandler):
                         SetHandler(submitCodeHandler, submitCode);
                         break;
@@ -441,6 +484,10 @@ namespace Microsoft.DotNet.Interactive
 
                     case (RequestCompletions requestCompletion, IKernelCommandHandler<RequestCompletions> requestCompletionHandler):
                         SetHandler(requestCompletionHandler, requestCompletion);
+                        break;
+
+                    case (RequestDiagnostics requestDiagnostics, IKernelCommandHandler<RequestDiagnostics> requestDiagnosticsHandler):
+                        SetHandler(requestDiagnosticsHandler, requestDiagnostics);
                         break;
 
                     case (RequestHoverText hoverCommand, IKernelCommandHandler<RequestHoverText> requestHoverTextHandler):
@@ -463,19 +510,11 @@ namespace Microsoft.DotNet.Interactive
 
         public void Dispose() => _disposables.Dispose();
 
-        public void SetProperty<T>(T property) where T : class
+        protected virtual ChooseKernelDirective CreateChooseKernelDirective()
         {
-            if (!_properties.TryAdd(typeof(T), property))
-            {
-                throw new InvalidOperationException($"Cannot add property with key {typeof(T)}.");
-            }
+            return new ChooseKernelDirective(this);
         }
 
-        public T GetProperty<T>() where T : class
-        {
-            return _properties.TryGetValue(typeof(T), out var property) 
-                ? property as T 
-                : throw new KeyNotFoundException($"Cannot find property {typeof(T)}.");
-        }
+        internal ChooseKernelDirective ChooseKernelDirective => _chooseKernelDirective ??= CreateChooseKernelDirective();
     }
 }

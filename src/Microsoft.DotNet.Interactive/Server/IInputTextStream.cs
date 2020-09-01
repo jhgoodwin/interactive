@@ -8,5 +8,6 @@ namespace Microsoft.DotNet.Interactive.Server
     public interface IInputTextStream : IObservable<string>, IDisposable
     {
         bool IsStarted { get; }
+       
     }
 }

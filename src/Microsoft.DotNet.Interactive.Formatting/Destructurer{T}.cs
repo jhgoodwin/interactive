@@ -3,9 +3,11 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 
 namespace Microsoft.DotNet.Interactive.Formatting
 {
@@ -42,15 +44,9 @@ namespace Microsoft.DotNet.Interactive.Formatting
                     return;
                 }
 
-                var propertiesAndFields = typeof(T).GetMembers(BindingFlags.Instance | BindingFlags.GetProperty | BindingFlags.GetField | BindingFlags.Public)
-                                                   .Where(m => !m.Name.Contains("<") && !m.Name.Contains("k__BackingField"))
-                                                   .Where(m => m.MemberType == MemberTypes.Property || m.MemberType == MemberTypes.Field)
-                                                   .Where(m => m.MemberType != MemberTypes.Property ||
-                                                               (((PropertyInfo) m).CanRead &&
-                                                                !((PropertyInfo) m).GetIndexParameters().Any()))
-                                                   .ToArray();
+                var members = typeof(T).GetMembersToFormat();
 
-                getters = propertiesAndFields
+                getters = members
                     .ToDictionary(member => member.Name,
                                   member => new Getter(member).GetValue,
                                   StringComparer.OrdinalIgnoreCase);

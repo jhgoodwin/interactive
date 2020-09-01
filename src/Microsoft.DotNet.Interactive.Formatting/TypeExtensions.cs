@@ -3,7 +3,7 @@
 
 using System;
 using System.Collections.Generic;
-using System.IO;
+using System.Diagnostics;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
@@ -11,14 +11,17 @@ using System.Runtime.CompilerServices;
 
 namespace Microsoft.DotNet.Interactive.Formatting
 {
-    internal static partial class TypeExtensions
+    internal static class TypeExtensions
     {
-        internal static bool CanBeInstantiated(this Type type)
+        private static readonly HashSet<Type> _typesToTreatAsScalar = new HashSet<Type>
         {
-            return !type.IsAbstract
-                   && !type.IsGenericTypeDefinition
-                   && !type.IsInterface;
-        }
+            typeof(decimal),
+            typeof(Guid),
+            typeof(string),
+            typeof(DateTime),
+            typeof(DateTimeOffset),
+            typeof(TimeSpan),
+        };
 
         public static string MemberName<T, TValue>(this Expression<Func<T, TValue>> expression)
         {
@@ -49,7 +52,7 @@ namespace Microsoft.DotNet.Interactive.Formatting
             this Type type,
             params Expression<Func<T, object>>[] forProperties)
         {
-            var allMembers = typeof(T).GetAllMembers(true).ToArray();
+            var allMembers = typeof(T).GetMembersToFormat(true).ToArray();
 
             if (forProperties == null || !forProperties.Any())
             {
@@ -70,17 +73,14 @@ namespace Microsoft.DotNet.Interactive.Formatting
                 .Select(MemberAccessor.CreateMemberAccessor<T>)
                 .ToArray();
 
-        public static IEnumerable<MemberInfo> GetAllMembers(this Type type, bool includeInternals = false)
+        public static IEnumerable<MemberInfo> GetMembersToFormat(this Type type, bool includeInternals = false)
         {
             var bindingFlags = includeInternals
                                    ? BindingFlags.Instance | BindingFlags.GetProperty | BindingFlags.GetField | BindingFlags.Public | BindingFlags.NonPublic
                                    : BindingFlags.Instance | BindingFlags.GetProperty | BindingFlags.GetField | BindingFlags.Public;
 
             return type.GetMembers(bindingFlags)
-                       .Where(m => !m.Name.Contains("<") && !m.Name.Contains("k__BackingField"))
-                       .Where(m => m.MemberType == MemberTypes.Property || m.MemberType == MemberTypes.Field)
-                       .Where(m => m.MemberType != MemberTypes.Property ||
-                                   ((PropertyInfo) m).CanRead && !((PropertyInfo) m).GetIndexParameters().Any())
+                       .Where(ShouldDisplay)
                        .ToArray();
         }
 
@@ -90,8 +90,33 @@ namespace Microsoft.DotNet.Interactive.Formatting
             {
                 yield return type;
             }
+
             foreach (var i in type.GetInterfaces())
+            {
                 yield return i;
+            }
+        }
+
+        public static bool IsRelevantFormatterFor(this Type type, Type actualType)
+        {
+            if (!type.IsGenericTypeDefinition)
+            {
+                return type.IsAssignableFrom(actualType);
+            }
+
+            var baseChain = actualType;
+            while (baseChain != null)
+            {
+                if (baseChain.IsGenericType && baseChain.GetGenericTypeDefinition().Equals(type))
+                    return true;
+                baseChain = baseChain.BaseType;
+            }
+            foreach (var i in actualType.GetInterfaces())
+            {
+                if (i.IsGenericType && i.GetGenericTypeDefinition().Equals(type))
+                    return true;
+            }
+            return false;
         }
 
         public static bool IsAnonymous(this Type type)
@@ -103,20 +128,12 @@ namespace Microsoft.DotNet.Interactive.Formatting
 
             return Attribute.IsDefined(type, typeof(CompilerGeneratedAttribute), false) &&
                    type.IsGenericType && type.Name.Contains("AnonymousType") &&
-                   (type.Name.StartsWith("<>") || type.Name.StartsWith("VB$")) &&
-                   (type.Attributes & TypeAttributes.NotPublic) == TypeAttributes.NotPublic;
+                   (type.Name.StartsWith("<>") || type.Name.StartsWith("VB$"));
         }
-
-        private static readonly HashSet<Type> _knownScalarTypes = new HashSet<Type>
-        {
-            typeof(decimal),
-            typeof(Guid),
-            typeof(string),
-        };
 
         public static bool IsScalar(this Type type)
         {
-            if (_knownScalarTypes.Contains(type))
+            if (_typesToTreatAsScalar.Contains(type))
             {
                 return true;
             }
@@ -145,6 +162,43 @@ namespace Microsoft.DotNet.Interactive.Formatting
             }
 
             return type.ToString().StartsWith("System.Tuple`");
+        }
+
+        public static bool ShouldDisplay(MemberInfo m)
+        {
+            if (!(m.MemberType == MemberTypes.Property ||
+                  m.MemberType == MemberTypes.Field))
+            {
+                return false;
+            }
+
+            if (!(!m.Name.Contains("<") &&
+                  !m.Name.Contains("k__BackingField")))
+            {
+                return false;
+            }
+
+            if (m.MemberType != MemberTypes.Property)
+            {
+                return true;
+            }
+
+            if (m is PropertyInfo property)
+            {
+                if (m.GetCustomAttribute<DebuggerBrowsableAttribute>() is {} b &&
+                    b.State == DebuggerBrowsableState.Never)
+                {
+                    return false;
+                }
+
+                if (property.CanRead &&
+                    property.GetIndexParameters().Length == 0)
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
     }
 }

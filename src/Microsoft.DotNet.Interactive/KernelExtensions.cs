@@ -4,21 +4,19 @@
 using System;
 using System.CommandLine;
 using System.CommandLine.Invocation;
+using System.CommandLine.Parsing;
 using System.Diagnostics;
-using System.IO.Pipes;
 using System.Linq;
-using System.Security.Principal;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.DotNet.Interactive.Commands;
+using Microsoft.DotNet.Interactive.Connection;
 using Microsoft.DotNet.Interactive.Events;
-using Microsoft.DotNet.Interactive.Server;
+using Microsoft.DotNet.Interactive.Formatting;
 using Microsoft.DotNet.Interactive.Utility;
-
 using Pocket;
-
 using CompositeDisposable = System.Reactive.Disposables.CompositeDisposable;
+using Formatter = Microsoft.DotNet.Interactive.Formatting.Formatter;
 
 namespace Microsoft.DotNet.Interactive
 {
@@ -37,8 +35,12 @@ namespace Microsoft.DotNet.Interactive
             return root switch
             {
                 _ when kernel.Name == name => kernel,
-                CompositeKernel c => c.ChildKernels
-                                      .SingleOrDefault(k => k.Name == name),
+                CompositeKernel c =>
+                c.Directives
+                 .OfType<ChooseKernelDirective>()
+                 .Where(d => d.HasAlias($"#!{name}"))
+                 .Select(d => d.Kernel)
+                 .SingleOrDefault(),
                 _ => null
             };
         }
@@ -126,17 +128,49 @@ namespace Microsoft.DotNet.Interactive
         }
 
         public static T UseDotNetVariableSharing<T>(this T kernel)
-            where T : DotNetLanguageKernel
+            where T : DotNetKernel
         {
+            var variableNameArg = new Argument<string>(
+                "name",
+                "The name of the variable to create in the destination kernel");
+
+            variableNameArg.AddSuggestions(_ =>
+            {
+                if (kernel.ParentKernel is { } composite)
+                {
+                    return composite.ChildKernels
+                                    .OfType<DotNetKernel>()
+                                    .SelectMany(k => k.GetVariableNames());
+                }
+
+                return Array.Empty<string>();
+            });
+
+            var fromKernelOption = new Option<string>(
+                "--from",
+                "The name of the kernel where the variable has been previously declared");
+
+            fromKernelOption.AddSuggestions(_ =>
+            {
+                if (kernel.ParentKernel is { } composite)
+                {
+                    return composite.ChildKernels
+                                    .OfType<DotNetKernel>()
+                                    .Select(k => k.Name);
+                }
+
+                return Array.Empty<string>();
+            });
+
             var share = new Command("#!share", "Share a .NET variable between subkernels")
             {
-                new Option<string>("--from", "The name of the kernel where the variable has been previously declared"),
-                new Argument<string>("name", "The name of the variable to create in the destination kernel")
+                fromKernelOption,
+                variableNameArg
             };
 
             share.Handler = CommandHandler.Create<string, string, KernelInvocationContext>(async (from, name, context) =>
             {
-                if (kernel.FindKernel(from) is DotNetLanguageKernel fromKernel)
+                if (kernel.FindKernel(from) is DotNetKernel fromKernel)
                 {
                     if (fromKernel.TryGetVariable(name, out object shared))
                     {
@@ -150,68 +184,75 @@ namespace Microsoft.DotNet.Interactive
             return kernel;
         }
 
-        public static CompositeKernel UseConnectionOverNamedPipe(this CompositeKernel kernel)
+        public static TKernel UseWho<TKernel>(this TKernel kernel)
+            where TKernel : DotNetKernel
         {
-            var connectionCommand = new Command("named-pipe");
-            connectionCommand.AddArgument(new Argument<string>("kernel-name"));
-            connectionCommand.AddArgument(new Argument<string>("pipe-name"));
-
-            connectionCommand.Handler = CommandHandler.Create<string, string, KernelInvocationContext>(async (kernelName, pipeName, context) =>
-            {
-                var existingProxyKernel = kernel.FindKernel(kernelName);
-                if (existingProxyKernel == null)
-                {
-                    var clientStream = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut,
-                        PipeOptions.Asynchronous, TokenImpersonationLevel.Impersonation);
-                    
-                    await clientStream.ConnectAsync();
-                    clientStream.ReadMode = PipeTransmissionMode.Message;
-                    var client = clientStream.CreateKernelClient();
-                    var proxyKernel = new ProxyKernel(kernelName, client);
-                    
-                    proxyKernel.RegisterForDisposal(client);
-                    kernel.Add(proxyKernel);
-
-                }
-            });
-            kernel.AddConnectionDirective(connectionCommand);
+            kernel.AddDirective(who_and_whos());
+            Formatter.Register(new CurrentVariablesFormatter());
             return kernel;
         }
 
-        public static CompositeKernel UseConnectionOverSignalR(this CompositeKernel kernel)
+        private static Command who_and_whos()
         {
-            var connectionCommand = new Command("signalr");
-            connectionCommand.AddArgument(new Argument<string>("kernel-name"));
-            connectionCommand.AddArgument(new Argument<string>("hub-url"));
-
-            connectionCommand.Handler = CommandHandler.Create<string, string, KernelInvocationContext>(async (kernelName, hubUrl, context) =>
+            var command = new Command("#!whos", "Display the names of the current top-level variables and their values.")
             {
-                var existingProxyKernel = kernel.FindKernel(kernelName);
-                if (existingProxyKernel == null)
+                Handler = CommandHandler.Create((ParseResult parseResult, KernelInvocationContext context) =>
                 {
-                  
-                    var connection = new HubConnectionBuilder()
-                        .WithUrl(hubUrl)
-                        .Build();
+                    var alias = parseResult.CommandResult.Token.Value;
 
-                    await connection.StartAsync();
+                    var detailed = alias == "#!whos";
 
-                    var client = connection.CreateKernelClient();
-                    var proxyKernel = new ProxyKernel(kernelName, client);
-                    await connection.SendAsync("connect");
+                    Display(context, detailed);
 
-                    proxyKernel.RegisterForDisposal(client);
-                    proxyKernel.RegisterForDisposal(async () =>
-                    {
-                        await connection.DisposeAsync();
-                    });
-                    
-                    kernel.Add(proxyKernel);
+                    return Task.CompletedTask;
+                })
+            };
 
-                    
+            // TODO: (who_and_whos) this should be a separate command with separate help
+            command.AddAlias("#!who");
+
+            return command;
+
+            void Display(KernelInvocationContext context, bool detailed)
+            {
+                if (context.Command is SubmitCode &&
+                    context.HandlingKernel is DotNetKernel kernel)
+                {
+                    var variables = kernel.GetVariableNames()
+                                          .Select(name =>
+                                          {
+                                              kernel.TryGetVariable(name, out object v);
+                                              return new CurrentVariable(name, v.GetType(), v);
+                                          });
+
+                    var currentVariables = new CurrentVariables(
+                        variables,
+                        detailed);
+
+                    var html = currentVariables
+                        .ToDisplayString(HtmlFormatter.MimeType);
+
+                    context.Publish(
+                        new DisplayedValueProduced(
+                            html,
+                            context.Command,
+                            new[]
+                            {
+                                new FormattedValue(
+                                    HtmlFormatter.MimeType,
+                                    html)
+                            }));
                 }
-            });
-            kernel.AddConnectionDirective(connectionCommand);
+            }
+        }
+
+        public static CompositeKernel UseKernelClientConnection<TOptions>(
+            this CompositeKernel kernel,
+            ConnectKernelCommand<TOptions> command)
+            where TOptions : KernelConnectionOptions
+        {
+            kernel.AddKernelConnection(command);
+
             return kernel;
         }
 
@@ -277,6 +318,16 @@ namespace Microsoft.DotNet.Interactive
             }
         }
 
+        public static void VisitSubkernelsAndSelf(
+            this Kernel kernel,
+            Action<Kernel> onVisit,
+            bool recursive = false)
+        {
+            onVisit(kernel);
+
+            VisitSubkernels(kernel, onVisit, recursive);
+        }
+
         public static async Task VisitSubkernelsAsync(
             this Kernel kernel,
             Func<Kernel, Task> onVisit,
@@ -304,6 +355,16 @@ namespace Microsoft.DotNet.Interactive
                     }
                 }
             }
+        }
+
+        public static async Task VisitSubkernelsAndSelfAsync(
+            this Kernel kernel,
+            Func<Kernel, Task> onVisit,
+            bool recursive = false)
+        {
+            await onVisit(kernel);
+
+            await VisitSubkernelsAsync(kernel, onVisit, recursive);
         }
     }
 }

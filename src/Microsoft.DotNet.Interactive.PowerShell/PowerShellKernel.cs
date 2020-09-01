@@ -2,14 +2,19 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 using System;
+using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.IO;
 using System.Linq;
 using System.Management.Automation.Language;
-using System.Management.Automation.Runspaces;   
+using System.Management.Automation.Runspaces;
 using System.Reflection;
 using System.Threading.Tasks;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.Text;
 using Microsoft.DotNet.Interactive.Commands;
 using Microsoft.DotNet.Interactive.Events;
+using Microsoft.DotNet.Interactive.Formatting;
 using Microsoft.DotNet.Interactive.PowerShell.Host;
 using Microsoft.PowerShell;
 using Microsoft.PowerShell.Commands;
@@ -21,8 +26,9 @@ namespace Microsoft.DotNet.Interactive.PowerShell
     using Microsoft.DotNet.Interactive.Utility;
 
     public class PowerShellKernel : 
-        DotNetLanguageKernel,
+        DotNetKernel,
         IKernelCommandHandler<RequestCompletions>,
+        IKernelCommandHandler<RequestDiagnostics>,
         IKernelCommandHandler<SubmitCode>
     {
         internal const string DefaultKernelName = "pwsh";
@@ -116,6 +122,12 @@ namespace Microsoft.DotNet.Interactive.PowerShell
             return pwsh;
         }
 
+        public override IReadOnlyCollection<string> GetVariableNames()
+        {
+            // FIX: (GetVariableNames) 
+            return Array.Empty<string>();
+        }
+
         public override bool TryGetVariable<T>(string name, out T value)
         {
             var variable = pwsh.Runspace.SessionStateProxy.PSVariable.Get(name);
@@ -159,6 +171,16 @@ namespace Microsoft.DotNet.Interactive.PowerShell
             {
                 context.Publish(new IncompleteCodeSubmissionReceived(submitCode));
             }
+
+            var formattedDiagnostics =
+                parseErrors
+                    .Select(d => d.ToString())
+                    .Select(text => new FormattedValue(PlainTextFormatter.MimeType, text))
+                    .ToImmutableArray();
+
+            var diagnostics = parseErrors.Select(ToDiagnostic).ToImmutableArray();
+
+            context.Publish(new DiagnosticsProduced(diagnostics, submitCode, formattedDiagnostics));
 
             // If there were parse errors, display them and return early.
             if (parseErrors.Length > 0)
@@ -224,6 +246,20 @@ namespace Microsoft.DotNet.Interactive.PowerShell
             }
 
             context.Publish(completion);
+            return Task.CompletedTask;
+        }
+
+        public Task HandleAsync(
+            RequestDiagnostics requestDiagnostics,
+            KernelInvocationContext context)
+        {
+            string code = requestDiagnostics.Code;
+
+            IsCompleteSubmission(code, out ParseError[] parseErrors);
+
+            var diagnostics = parseErrors.Select(ToDiagnostic);
+            context.Publish(new DiagnosticsProduced(diagnostics, requestDiagnostics));
+
             return Task.CompletedTask;
         }
 
@@ -303,6 +339,17 @@ namespace Microsoft.DotNet.Interactive.PowerShell
                 : new ErrorRecord(e, "JupyterPSHost.ReportException", ErrorCategory.NotSpecified, targetObject: null);
 
             ReportError(error);
+        }
+
+        private static Diagnostic ToDiagnostic(ParseError parseError)
+        {
+            return new Diagnostic(
+                new LinePositionSpan(
+                    new LinePosition(parseError.Extent.StartLineNumber - 1, parseError.Extent.StartColumnNumber),
+                    new LinePosition(parseError.Extent.EndLineNumber - 1, parseError.Extent.EndColumnNumber)),
+                DiagnosticSeverity.Error,
+                parseError.ErrorId,
+                parseError.Message);
         }
     }
 }

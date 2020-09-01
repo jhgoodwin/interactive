@@ -52,6 +52,7 @@ namespace Microsoft.DotNet.Interactive.Server
                 [nameof(CompleteCodeSubmissionReceived)] = typeof(KernelEventEnvelope<CompleteCodeSubmissionReceived>),
                 [nameof(CompletionsProduced)] = typeof(KernelEventEnvelope<CompletionsProduced>),
                 [nameof(DiagnosticLogEntryProduced)] = typeof(KernelEventEnvelope<DiagnosticLogEntryProduced>),
+                [nameof(DiagnosticsProduced)] = typeof(KernelEventEnvelope<DiagnosticsProduced>),
                 [nameof(DisplayedValueProduced)] = typeof(KernelEventEnvelope<DisplayedValueProduced>),
                 [nameof(DisplayedValueUpdated)] = typeof(KernelEventEnvelope<DisplayedValueUpdated>),
                 [nameof(ErrorProduced)] = typeof(KernelEventEnvelope<ErrorProduced>),
@@ -59,12 +60,15 @@ namespace Microsoft.DotNet.Interactive.Server
                 [nameof(InputRequested)] = typeof(KernelEventEnvelope<InputRequested>),
                 [nameof(HoverTextProduced)] = typeof(KernelEventEnvelope<HoverTextProduced>),
                 [nameof(KernelReady)] = typeof(KernelEventEnvelope<KernelReady>),
+                [nameof(NotebookParsed)] = typeof(KernelEventEnvelope<NotebookParsed>),
+                [nameof(NotebookSerialized)] = typeof(KernelEventEnvelope<NotebookSerialized>),
                 [nameof(PackageAdded)] = typeof(KernelEventEnvelope<PackageAdded>),
                 [nameof(PasswordRequested)] = typeof(KernelEventEnvelope<PasswordRequested>),
                 [nameof(ReturnValueProduced)] = typeof(KernelEventEnvelope<ReturnValueProduced>),
                 [nameof(StandardErrorValueProduced)] = typeof(KernelEventEnvelope<StandardErrorValueProduced>),
                 [nameof(StandardOutputValueProduced)] = typeof(KernelEventEnvelope<StandardOutputValueProduced>),
                 [nameof(WorkingDirectoryChanged)] = typeof(KernelEventEnvelope<WorkingDirectoryChanged>),
+                [nameof(KernelExtensionLoaded)] = typeof(KernelEventEnvelope<KernelExtensionLoaded>),
             };
 
             _eventTypesByEventTypeName = _envelopeTypesByEventTypeName

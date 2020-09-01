@@ -7,6 +7,9 @@ import {
     CommandSucceededType,
     CompletionsProduced,
     CompletionsProducedType,
+    Diagnostic,
+    DiagnosticsProduced,
+    DiagnosticsProducedType,
     DisplayEvent,
     DisplayedValueProducedType,
     DisplayedValueUpdatedType,
@@ -20,6 +23,15 @@ import {
     KernelEventEnvelopeObserver,
     KernelEventType,
     KernelTransport,
+    NotebookDocument,
+    NotebookParsed,
+    NotebookParsedType,
+    NotebookSerialized,
+    NotebookSerializedType,
+    ParseNotebook,
+    ParseNotebookType,
+    SerializeNotebook,
+    SerializeNotebookType,
     RequestCompletions,
     RequestCompletionsType,
     RequestHoverText,
@@ -30,8 +42,11 @@ import {
     SubmissionType,
     SubmitCode,
     SubmitCodeType,
+    RequestDiagnostics,
+    RequestDiagnosticsType,
 } from './contracts';
 import { CellOutput, CellErrorOutput, CellOutputKind, CellDisplayOutput } from './interfaces/vscode';
+import { Eol } from './interfaces';
 
 export class InteractiveClient {
     private nextToken: number = 1;
@@ -43,20 +58,46 @@ export class InteractiveClient {
         kernelTransport.subscribeToKernelEvents(eventEnvelope => this.eventListener(eventEnvelope));
     }
 
-    async execute(source: string, language: string, observer: { (outputs: Array<CellOutput>): void }, token?: string | undefined): Promise<void> {
+    async parseNotebook(fileName: string, rawData: Uint8Array, token?: string | undefined): Promise<NotebookDocument> {
+        const command: ParseNotebook = {
+            fileName,
+            rawData,
+            targetKernelName: '.NET' // this command MUST be handled by the composite kernel
+        };
+        const notebookParsed = await this.submitCommandAndGetResult<NotebookParsed>(command, ParseNotebookType, NotebookParsedType, token);
+        return notebookParsed.notebook;
+    }
+
+    async serializeNotebook(fileName: string, notebook: NotebookDocument, eol: Eol, token?: string | undefined): Promise<Uint8Array> {
+        const command: SerializeNotebook = {
+            fileName,
+            notebook,
+            newLine: eol,
+            targetKernelName: '.NET' // this command MUST be handled by the composite kernel
+        };
+        const serializedNotebook = await this.submitCommandAndGetResult<NotebookSerialized>(command, SerializeNotebookType, NotebookSerializedType, token);
+        return serializedNotebook.rawData;
+    }
+
+    async execute(source: string, language: string, outputObserver: { (outputs: Array<CellOutput>): void }, diagnosticObserver: (diags: Array<Diagnostic>) => void, token?: string | undefined): Promise<void> {
         return new Promise(async (resolve, reject) => {
+            let diagnostics: Array<Diagnostic> = [];
             let outputs: Array<CellOutput> = [];
 
-            let reportOutputs = () => {
-                observer(outputs);
+            let reportDiagnostics = () => {
+                diagnosticObserver(diagnostics);
             };
 
-            let disposable = await this.submitCode(source, language, eventEnvelope => {
+            let reportOutputs = () => {
+                outputObserver(outputs);
+            };
+
+            await this.submitCode(source, language, eventEnvelope => {
                 if (this.deferredOutput.length > 0) {
                     outputs.push(...this.deferredOutput);
                     this.deferredOutput = [];
                 }
-    
+
                 switch (eventEnvelope.eventType) {
                     case CommandSucceededType:
                         resolve();
@@ -72,8 +113,14 @@ export class InteractiveClient {
                             };
                             outputs.push(output);
                             reportOutputs();
-                            disposable.dispose(); // is this correct?
-                            reject(err);
+                            resolve();
+                        }
+                        break;
+                    case DiagnosticsProducedType:
+                        {
+                            const diags = <DiagnosticsProduced>eventEnvelope.event;
+                            diagnostics.push(...diags.diagnostics);
+                            reportDiagnostics();
                         }
                         break;
                     case StandardErrorValueProducedType:
@@ -105,7 +152,7 @@ export class InteractiveClient {
                                     this.valueIdMap.set(disp.valueId, {
                                         idx: outputs.length,
                                         outputs,
-                                        observer
+                                        observer: outputObserver
                                     });
                                     outputs.push(output);
                                 }
@@ -144,6 +191,15 @@ export class InteractiveClient {
             targetKernelName: language
         };
         return this.submitCommandAndGetResult<HoverTextProduced>(command, RequestHoverTextType, HoverTextProducedType, token);
+    }
+
+    async getDiagnostics(language: string, code: string, token?: string | undefined): Promise<Array<Diagnostic>> {
+        const command: RequestDiagnostics = {
+            code,
+            targetKernelName: language
+        };
+        const diagsProduced = await this.submitCommandAndGetResult<DiagnosticsProduced>(command, RequestDiagnosticsType, DiagnosticsProducedType, token);
+        return diagsProduced.diagnostics;
     }
 
     async submitCode(code: string, language: string, observer: KernelEventEnvelopeObserver, token?: string | undefined): Promise<DisposableSubscription> {
@@ -228,7 +284,7 @@ export class InteractiveClient {
                 for (let listener of listeners) {
                     listener(eventEnvelope);
                 }
-            } else {
+            } else if (token.startsWith("deferredCommand::")) {
                 switch (eventEnvelope.eventType) {
                     case DisplayedValueProducedType:
                     case DisplayedValueUpdatedType:

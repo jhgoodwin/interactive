@@ -6,29 +6,34 @@ using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.CommandLine;
+using System.CommandLine.Invocation;
 using System.CommandLine.Parsing;
 using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
 using System.Threading.Tasks;
 using Microsoft.DotNet.Interactive.Commands;
+using Microsoft.DotNet.Interactive.Connection;
 using Microsoft.DotNet.Interactive.Events;
 using Microsoft.DotNet.Interactive.Extensions;
+using Microsoft.DotNet.Interactive.Notebook;
 using Microsoft.DotNet.Interactive.Parsing;
 
 namespace Microsoft.DotNet.Interactive
 {
-    public sealed class CompositeKernel : 
+    public sealed class CompositeKernel :
         Kernel,
         IExtensibleKernel,
-        IEnumerable<Kernel>
+        IEnumerable<Kernel>,
+        IKernelCommandHandler<ParseNotebook>,
+        IKernelCommandHandler<SerializeNotebook>
     {
         private readonly ConcurrentQueue<PackageAdded> _packagesToCheckForExtensions = new ConcurrentQueue<PackageAdded>();
         private readonly List<Kernel> _childKernels = new List<Kernel>();
         private readonly Dictionary<string, Kernel> _kernelsByNameOrAlias;
         private readonly AssemblyBasedExtensionLoader _extensionLoader = new AssemblyBasedExtensionLoader();
         private string _defaultKernelName;
-        private Command _connectCommand;
+        private Command _connectDirective;
 
         public CompositeKernel() : base(".NET")
         {
@@ -92,13 +97,35 @@ namespace Microsoft.DotNet.Interactive
             RegisterForDisposal(kernel);
         }
 
-        private void AddChooseKernelDirective(
-            Kernel kernel, 
-            IEnumerable<string> aliases)
+        public Task HandleAsync(ParseNotebook command, KernelInvocationContext context)
         {
-            var chooseKernelCommand = new ChooseKernelDirective(kernel);
+            var notebook = ParseNotebook(command.FileName, command.RawData);
+            context.Publish(new NotebookParsed(notebook, command));
+            return Task.CompletedTask;
+        }
 
-            if (aliases is { })
+        public NotebookDocument ParseNotebook(string fileName, byte[] rawData)
+        {
+            var kernelLanguageAliases = _kernelsByNameOrAlias.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Name);
+            kernelLanguageAliases.Remove(Name); // remove `.NET`
+            var notebook = NotebookFileFormatHandler.Parse(fileName, rawData, DefaultKernelName, kernelLanguageAliases);
+            return notebook;
+        }
+
+        public Task HandleAsync(SerializeNotebook command, KernelInvocationContext context)
+        {
+            var rawData = NotebookFileFormatHandler.Serialize(command.FileName, command.Notebook, command.NewLine);
+            context.Publish(new NotebookSerialized(rawData, command));
+            return Task.CompletedTask;
+        }
+
+        private void AddChooseKernelDirective(
+            Kernel kernel,
+            IEnumerable<string> aliases = null)
+        {
+            var chooseKernelCommand = kernel.ChooseKernelDirective;
+
+            if (aliases is {})
             {
                 foreach (var alias in aliases)
                 {
@@ -198,42 +225,57 @@ namespace Microsoft.DotNet.Interactive
             }
         }
 
-        private protected override IReadOnlyList<CompletionItem> GetDirectiveCompletionItems(
-            DirectiveNode directiveNode,
+        private protected override IEnumerable<Parser> GetDirectiveParsersForCompletion(
+            DirectiveNode directiveNode, 
             int requestPosition)
         {
-            var directiveParsers = new List<Parser>
-            {
-                SubmissionParser.GetDirectiveParser()
-            };
+            var upToCursor =
+                directiveNode.Text[..requestPosition];
 
-            for (var i = 0; i < ChildKernels.Count; i++)
-            {
-                var kernel = ChildKernels[i];
+            var indexOfPreviousSpace =
+                upToCursor.LastIndexOf(" ", StringComparison.CurrentCultureIgnoreCase);
 
-                if (kernel is { })
+            var compositeKernelDirectiveParser = SubmissionParser.GetDirectiveParser();
+
+            if (indexOfPreviousSpace >= 0 &&
+                directiveNode is ActionDirectiveNode actionDirectiveNode)
+            {
+                // if the first token has been specified, we can narrow down to the specific directive parser that defines this directive
+
+                var directiveName = directiveNode.ChildNodesAndTokens[0].Text;
+
+                var kernel = this.FindKernel(actionDirectiveNode.ParentKernelName);
+
+                var languageKernelDirectiveParser = kernel.SubmissionParser.GetDirectiveParser();
+
+                if (IsDirectiveDefinedIn(languageKernelDirectiveParser))
                 {
-                    directiveParsers.Add(kernel.SubmissionParser.GetDirectiveParser());
+                    // the directive is defined in the subkernel, so this is the only directive parser we need
+                    yield return languageKernelDirectiveParser;
+                }
+                else if (IsDirectiveDefinedIn(compositeKernelDirectiveParser))
+                {
+                    yield return compositeKernelDirectiveParser;
+                }
+
+                bool IsDirectiveDefinedIn(Parser parser) => 
+                    parser.Configuration.RootCommand.Children.GetByAlias(directiveName) is { };
+            }
+            else
+            {
+                // otherwise, return all directive parsers from the CompositeKernel as well as subkernels
+                yield return compositeKernelDirectiveParser;
+
+                for (var i = 0; i < ChildKernels.Count; i++)
+                {
+                    var kernel = ChildKernels[i];
+
+                    if (kernel is { })
+                    {
+                        yield return kernel.SubmissionParser.GetDirectiveParser();
+                    }
                 }
             }
-
-            var allCompletions = new List<CompletionItem>();
-
-            foreach (var parser in directiveParsers)
-            {
-                var parseResult = parser.Parse(directiveNode.Text);
-
-                var completions = parseResult
-                                  .GetSuggestions(requestPosition)
-                                  .Select(s => SubmissionParser.CompletionItemFor(s, parseResult))
-                                  .ToArray();
-
-                allCompletions.AddRange(completions);
-            }
-
-            return allCompletions
-                   .Distinct(CompletionItemComparer.Instance)
-                   .ToArray();
         }
 
         public IEnumerator<Kernel> GetEnumerator() => _childKernels.GetEnumerator();
@@ -250,18 +292,54 @@ namespace Microsoft.DotNet.Interactive
                 context);
         }
 
-        public void AddConnectionDirective(Command connectionCommand)
+        public void AddKernelConnection<TOptions>(
+            ConnectKernelCommand<TOptions> connectionCommand)
+            where TOptions : KernelConnectionOptions
         {
-            if (_connectCommand == null)
+            // FIX: (AddKernelConnection) use a global option
+            var kernelNameOption = new Option<string>(
+                "--kernel-name",
+                "The name of the subkernel to be added");
+
+            if (_connectDirective == null)
             {
-                _connectCommand = new Command("#!connect", "Provides functionality to connect to kernels");
-              
-                AddDirective(_connectCommand);
+                _connectDirective = new Command(
+                    "#!connect", 
+                    "Connects additional subkernels");
+
+                _connectDirective.Add(kernelNameOption);
+
+                AddDirective(_connectDirective);
             }
 
-            _connectCommand.AddCommand(connectionCommand);
+            connectionCommand.Handler = CommandHandler.Create<
+                TOptions, KernelInvocationContext>(
+                async (options, context) =>
+                {
+                    var connectedKernel = await connectionCommand.CreateKernelAsync(options, context);
 
-           SubmissionParser.ResetParser();
+                    connectedKernel.Name = options.KernelName;
+
+                    Add(connectedKernel);
+
+                    var chooseKernelDirective =
+                        Directives.OfType<ChooseKernelDirective>()
+                                  .Single(d => d.Kernel == connectedKernel);
+
+                    if (!string.IsNullOrWhiteSpace(connectionCommand.ConnectedKernelDescription))
+                    {
+                        chooseKernelDirective.Description = connectionCommand.ConnectedKernelDescription;
+                    }
+
+                    chooseKernelDirective.Description += " (Connected kernel)";
+
+                    context.Display($"Kernel added: #!{connectedKernel.Name}");
+                });
+
+            connectionCommand.Add(kernelNameOption);
+            _connectDirective.Add(connectionCommand);
+
+            SubmissionParser.ResetParser();
         }
     }
 }
